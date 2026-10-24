@@ -235,7 +235,7 @@ peer = 任何人（兜底）→  agent chat   →  profile=full + 56 项 deny（
 
 ## 踩坑清单
 
-`docs/pitfalls.md` 里记了 70 条，随手摘几条最坑的：
+`docs/pitfalls.md` 里记了 71 条，随手摘几条最坑的：
 
 - `ChatContent.MessageBubbleList` 是 **internal 属性**，编译期不可见，必须反射
 - `LocateConversation()` **是个假方法**，调完不切会话，读出来的还是上一个会话的气泡
