@@ -216,6 +216,12 @@ async Task<bool> SubmitMonitor(string who)
                                 if (baseline) continue;
                                 string txt0 = (m.Message ?? "").Trim();
                                 if (txt0.Length == 0) continue;
+                                // 自己发的消息（含通过 /api/upload/send 发出去的文件）不能入队。
+                                // _sent 只记文本，而文件消息的文本是「文件\nxxx.pdf\n150K」，
+                                // 匹配不上 —— 重启补扫就会把自己发过的文件当成新消息，
+                                // 让 agent 回一句「收到这个文件」。用发送者判断才可靠。
+                                string snd0 = (ReadMember(m, "Who") as string) ?? "";
+                                if (!string.IsNullOrEmpty(_self) && snd0 == _self) continue;
                                 bool echo0;
                                 lock (_seenLock) { echo0 = _sent.Contains(txt0); }
                                 if (echo0) continue;
@@ -262,6 +268,9 @@ async Task<bool> SubmitMonitor(string who)
                                 lock (_seenLock) { fresh = _seen.Add(m.UniqueString); }
                                 if (!fresh) continue;
                                 string txt = (m.Message ?? "").Trim();
+                                string snd = (ReadMember(m, "Who") as string) ?? "";
+                                // 同上：自己发的一律跳过，别让 agent 回自己的话/自己的文件
+                                if (!string.IsNullOrEmpty(_self) && snd == _self) continue;
                                 bool echo;
                                 lock (_seenLock) { echo = txt.Length > 0 && _sent.Contains(txt); }
                                 if (echo) continue;
@@ -716,6 +725,18 @@ app.MapPost("/api/send", async (M m) =>
         if (string.IsNullOrWhiteSpace(m.who) || string.IsNullOrEmpty(m.text))
             return J(new { ok = false, error = "who/text 不能为空" });
         var c = C();
+        // ⚠️ SDK 的 SendMessage 在找不到会话时**既不报错也不发**，静默返回成功
+        // （实测：发给「__不存在的会话__」，接口回 ok:true，微信里什么都没发生）。
+        // 这里只留个痕迹方便排查，不用它拦截 —— visible 列表可能有分页，
+        // 误拦掉一条正常消息的代价比漏记一条日志大得多。
+        try
+        {
+            var vis = await c.GetVisibleConversations();
+            if (vis != null && vis.Count > 0 &&
+                !vis.Any(v => (v.ConversationTitle ?? "") == m.who))
+                Console.WriteLine("[send] WARN 目标会话不在可见列表: " + m.who);
+        }
+        catch { }
         await c.SendMessage(m.who, m.text);
         MarkSent(m.text);
         return J(new { ok = true });
@@ -1151,14 +1172,35 @@ app.MapGet("/api/history/deep", async (string who, int? pages, int? limit) =>
     finally { _uiLock.Release(); }
 });
 
+// 每次发送用独立子目录：两个会话同时发「报告.pdf」时，共用一个文件名会互相覆盖，
+// 先写的还没发出去就被后写的盖掉 —— 结果把 A 的文件发给了 B。
+// 顺带把一小时前的旧目录清掉，否则 Temp 会一直涨。
+string NewWxOutDir()
+{
+    var root = Path.Combine(Path.GetTempPath(), "wxout");
+    Directory.CreateDirectory(root);
+    try
+    {
+        var cutoff = DateTime.Now.AddHours(-1);
+        foreach (var d in Directory.GetDirectories(root))
+        {
+            try { if (Directory.GetLastWriteTime(d) < cutoff) Directory.Delete(d, true); }
+            catch { }
+        }
+    }
+    catch { }
+    var dir = Path.Combine(root, Guid.NewGuid().ToString("N").Substring(0, 12));
+    Directory.CreateDirectory(dir);
+    return dir;
+}
+
 app.MapPost("/api/upload", async (U u) =>
 {
     try
     {
         if (string.IsNullOrWhiteSpace(u.name) || string.IsNullOrEmpty(u.data))
             return J(new { ok = false, error = "name/data 不能为空" });
-        var dir = Path.Combine(Path.GetTempPath(), "wxout");
-        Directory.CreateDirectory(dir);
+        var dir = NewWxOutDir();
         var safe = string.Join("_", u.name.Split(Path.GetInvalidFileNameChars()));
         var path = Path.Combine(dir, safe);
         var bytes = Convert.FromBase64String(u.data);
@@ -1174,8 +1216,7 @@ app.MapPost("/api/upload/send", async (US u) =>
     {
         if (string.IsNullOrWhiteSpace(u.who) || u.files == null || u.files.Length == 0)
             return J(new { ok = false, error = "who/files 不能为空" });
-        var dir = Path.Combine(Path.GetTempPath(), "wxout");
-        Directory.CreateDirectory(dir);
+        var dir = NewWxOutDir();
         var saved = new List<string>();
         foreach (var f in u.files)
         {

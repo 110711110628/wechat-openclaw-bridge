@@ -9,6 +9,7 @@
 import base64
 import queue
 import re
+import socket
 import zipfile
 import json
 import os
@@ -318,11 +319,12 @@ def collect_outbox(d, since, token=""):
 
 
 def send_files(who, paths):
-    files = []
+    files, skipped = [], []
     for p in paths:
         try:
             if os.path.getsize(p) > MAX_FILE:
-                log("SKIP big file", p)
+                log("SKIP big file", p, os.path.getsize(p))
+                skipped.append(os.path.basename(p))
                 continue
             with open(p, "rb") as f:
                 raw = f.read()
@@ -332,8 +334,12 @@ def send_files(who, paths):
                           "data": base64.b64encode(raw).decode("ascii")})
         except Exception as e:
             log("file read error", p, repr(e))
+    if skipped:
+        # 超过上限的文件悄悄不发，用户会以为文件丢了
+        send_text(who, "这几个文件超过 20MB，微信发不了：%s" % "、".join(skipped))
     if not files:
-        return False
+        # 全是超大文件也算"处理完了"，不然会被放回 out 目录无限重试
+        return bool(skipped)
     try:
         r = api("/api/upload/send", {"who": who, "files": files}, timeout=300)
         log("FILES", who, "count=", len(files), "resp=", str(r)[:160])
@@ -451,14 +457,37 @@ def shot_image(who, idx, agent=None):
         return None
     d = INBOX_DIRS.get(agent) or "/home/wechat/.openclaw/workspace-chat/inbox"
     os.makedirs(d, exist_ok=True)
-    p = os.path.join(d, "img_%s.png" % time.strftime("%H%M%S"))
+    # 只精确到秒会在同一秒内截两张时互相覆盖，加毫秒尾巴
+    p = os.path.join(d, "img_%s_%03d.png"
+                     % (time.strftime("%H%M%S"), int(time.time() * 1000) % 1000))
     with open(p, "wb") as f:
         f.write(raw)
+    prune_inbox(d)
     log("shot saved", p, len(raw))
     return p
 
 
 MAX_DOC_CHARS = 8000
+MAX_TEXT_READ = 200000          # 文本类最多读这么多字符，够 25 倍的 MAX_DOC_CHARS
+MAX_PARSE_BYTES = 40 * 1024 * 1024
+INBOX_KEEP_DAYS = 7
+
+
+def prune_inbox(d):
+    """inbox 只增不减，攒几个月就是一堆没用的截图和附件。
+    每存一个新文件顺手清掉 7 天前的（目录里文件不多，listdir 很便宜）。"""
+    try:
+        cutoff = time.time() - INBOX_KEEP_DAYS * 86400
+        for n in os.listdir(d):
+            p = os.path.join(d, n)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
 
 
 def parse_file_name(raw):
@@ -499,8 +528,17 @@ def read_document(path):
     """尽量把文件抽成纯文本；抽不出来返回空串（绝不假装读到了）。"""
     low = path.lower()
     try:
+        sz = os.path.getsize(path)
+        if sz > MAX_PARSE_BYTES:
+            log("read_document: 文件太大，只给路径不给正文", os.path.basename(path), sz)
+            return ""
+    except OSError:
+        pass
+    try:
         if low.endswith((".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".html", ".xml", ".yaml", ".yml")):
-            return open(path, encoding="utf-8", errors="replace").read()
+            # 一定要带长度上限：一个几百 MB 的 txt 直接 read() 会把内存吃光
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read(MAX_TEXT_READ)
         if low.endswith(".pdf"):
             r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", path, "-"],
                                capture_output=True, timeout=90)
@@ -535,6 +573,19 @@ def fetch_file(who, raw, agent):
         log("FILE not on disk", who, name[:60])
         return None
 
+    # 陌生人和群里发的大文件不往本机搬：一天几十个 30MB 就能把盘塞满。
+    # 主人自己发的照收（上限 30MB，跟 wxapi 那边一致）。
+    try:
+        fsz = int(hit.get("size") or 0)
+    except (TypeError, ValueError):
+        fsz = 0
+    lim = 30 * 1024 * 1024 if agent == PRIV_AGENT else 10 * 1024 * 1024
+    if fsz > lim:
+        log("FILE too big", who, hit.get("name"), fsz, "limit", lim)
+        return ("（对方发来一个文件：%s，约 %.1fMB。这个比我这里能收的大，"
+                "内容我读不到；要处理的话让对方压一下或者把正文贴过来）"
+                % (hit.get("name"), fsz / 1048576.0))
+
     try:
         g = api("/api/file/get?path=" + urllib.parse.quote(hit["path"]), timeout=300)
         blob = base64.b64decode(g.get("b64") or "")
@@ -545,9 +596,13 @@ def fetch_file(who, raw, agent):
     d0 = INBOX_DIRS.get(agent) or INBOX_DIRS.get(PRIV_AGENT) or "/tmp"
     try:
         os.makedirs(d0, exist_ok=True)
-        dst = os.path.join(d0, "%d_%s" % (int(time.time()), os.path.basename(hit["name"])))
+        # 同一秒收到两个同名文件会互相覆盖，带毫秒尾巴
+        dst = os.path.join(d0, "%d%03d_%s"
+                           % (int(time.time()), int(time.time() * 1000) % 1000,
+                              os.path.basename(hit["name"])))
         with open(dst, "wb") as f:
             f.write(blob)
+        prune_inbox(d0)
     except Exception as e:
         log("file save error", repr(e)[:120])
         return None
@@ -637,15 +692,31 @@ def visual_text(who, raw, agent=None):
 
 
 def send_text(who, text, tries=3):
-    """发文本，网络抖动重试；失败只记日志不抛。"""
+    """发文本。两条铁律：
+
+    1. **必须看 ok 字段**。wxapi 内部抛异常时 HTTP 状态还是 200，只是 body 里
+       `{"ok":false,"error":...}`。不看就会把失败记成 SENT —— 用户什么都没收到，
+       日志却一片正常，这种静默失败最难查。
+    2. **超时不要重试**。请求可能已经到达并被发出去了，重试就是给用户发两遍。
+       只对「连接失败」这类确定性没送到的错误重试。
+    """
     for i in range(tries):
         try:
-            api("/api/send", {"who": who, "text": text}, timeout=180)
+            r = api("/api/send", {"who": who, "text": text}, timeout=180)
+        except Exception as e:
+            # 超时 / 读超时：请求可能已经在服务端执行完，重试会重复发
+            if isinstance(e, socket.timeout) or "timed out" in str(e).lower():
+                log("send timeout（可能已发出，不重试）", who, repr(text[:60]))
+                return False
+            log("send error", who, "try%d" % (i + 1), repr(e)[:120])
+            if i + 1 < tries:
+                time.sleep(2 + i * 2)
+            continue
+        if r.get("ok"):
             log("SENT", who, repr(text[:100]))
             return True
-        except Exception as e:
-            log("send error", who, "try%d" % (i + 1), repr(e)[:120])
-            time.sleep(2 + i * 2)
+        log("send rejected", who, str(r)[:160])
+        return False            # 服务端明确拒绝，重试没有意义
     return False
 
 
@@ -767,12 +838,20 @@ def handle(it):
     outdir = OUT_DIRS.get(agent)
     t0 = time.time()
     reply = ask(agent, session, prompt)
+    if not reply:
+        # 一次性失败很常见（模型超时、网关抖一下）。重试一次，同一个 session-key
+        # 上下文还在，比让用户干等着强。
+        log("no reply, retry once", who)
+        time.sleep(2)
+        reply = ask(agent, session, prompt)
     if reply:
         reply = clean_reply(reply)[:MAX_REPLY]
         if reply:
             send_long(who, reply)
     else:
-        log("no reply", who)
+        # 彻底失败必须让用户知道，否则他以为消息丢了、或者以为被无视了
+        log("no reply (give up)", who)
+        send_text(who, "我这边刚才卡了一下，没生成出回复。你再说一遍？")
 
     # 回传本轮 agent 生成的文件
     if outdir:
@@ -781,12 +860,27 @@ def handle(it):
             log("OUTBOX", who, [os.path.basename(x) for x in files])
             if send_files(who, files):
                 archive(files, outdir)
+            else:
+                # 发失败别把文件扣在 .claimed 里 —— 那目录没人再扫，等于永久丢失。
+                # 放回 out 目录（并刷新 mtime，否则下一轮的 since 判断会跳过它），
+                # 下一条消息触发时还会被重新收走。
+                back = 0
+                for p in files:
+                    try:
+                        dst = os.path.join(outdir, os.path.basename(p))
+                        os.replace(p, dst)
+                        os.utime(dst, None)
+                        back += 1
+                    except OSError as e:
+                        log("putback error", repr(e)[:100])
+                log("OUTBOX putback", who, back)
 
 
 def _worker(idx):
     q = _queues[idx]
     while True:
         it = q.get()
+        who = it.get("who") or ""
         try:
             handle(it)
         except Exception as e:
@@ -794,7 +888,16 @@ def _worker(idx):
             # 占位是入队时就打的，失败要撤回来，否则这条消息永远丢掉
             unmark_seen((it.get("uniq") or "").strip())
         finally:
+            with _inflight_lock:
+                _inflight[who] = max(0, _inflight.get(who, 1) - 1)
             q.task_done()
+
+
+# 同一会话最多允许几条「排队 + 处理中」。不设上限的话，一个陌生人狂发消息就能
+# 把 3 个 worker 全占满，主人跟着一起卡住 —— 而这台机器是给主人用的。
+MAX_PER_CONV = 3
+_inflight = {}
+_inflight_lock = threading.Lock()
 
 
 def dispatch(it):
@@ -813,6 +916,13 @@ def dispatch(it):
     if seen_before(uniq):
         log("SKIP", who, "dup(after-restart)", repr((it.get("text") or "")[:40]))
         return
+    with _inflight_lock:
+        n = _inflight.get(who, 0)
+        if n >= MAX_PER_CONV:
+            log("DROP", who, "同一会话已积压 %d 条，丢弃这条" % n,
+                repr((it.get("text") or "")[:40]))
+            return
+        _inflight[who] = n + 1
     # 入队就占位：同一批 items 里若有同一条消息的重复，后面那条立刻被挡住
     mark_seen(uniq)
     idx = abs(hash(who)) % WORKERS

@@ -407,9 +407,9 @@ int cx = x + (int)(w * 0.52);   // 0.52 附近是「转文字」，0.25 左右�
 日志里长这样，看着毫无异常：
 
 ```
-probe 雨霖 -> direct                                          # 用户发第一条，正常
-probe 雨霖 -> group (by sender=OpenClaw)                      # 机器人回完，自己踩自己
-SKIP  雨霖 group-not-mention '又发了一条消息'                    # 从此不 @ 就不理
+probe 主人 -> direct                                          # 用户发第一条，正常
+probe 主人 -> group (by sender=OpenClaw)                      # 机器人回完，自己踩自己
+SKIP  主人 group-not-mention '又发了一条消息'                    # 从此不 @ 就不理
 ```
 
 修复要两层：
@@ -531,3 +531,179 @@ for it in items:
 
 另一个纯 bug：`group-IDENTITY.md` 里写着「我是「某个人名」」—— 从私聊那份复制过来忘了改。
 提示词这种地方只要复制过一次，就一定会带出这种错误。
+
+---
+
+## 第三轮自查：失败路径（23:10~23:15）
+
+前两轮盯的是「消息有没有被正确处理」，这一轮专门盯**失败的那条路**。
+正常运行谁都看得见，出问题时没人看得见 —— 这七条全是「明明失败了，日志却是绿的」。
+
+### 47. HTTP 200 不等于发成功，要看 body 里的 `ok`
+
+wxapi 内部抛异常时，异常会被顶层 handler 吃掉并转成
+`{"ok": false, "error": "..."}` —— **HTTP 状态码仍然是 200**。
+
+```python
+r = api("/api/send", {...})
+log("SENT", who)                     # ✗ 只要没抛异常就记成功
+```
+
+后果是用户什么都没收到，日志一片正常，等你发现时已经过去几小时。
+
+```python
+if r.get("ok"):
+    return True
+log("send rejected", who, str(r)[:160])
+return False                          # ✓ 拿 ok 当唯一判据
+```
+
+同理，`/api/inbound`、`/api/file/get` 都要判 `ok`，不能只看能不能连通。
+这个项目的**所有**接口都统一返回 `{ok, ...}`，就是为了让调用方只有一条判断路径。
+
+### 48. 超时不要重试
+
+发送超时的时候，请求**可能已经到达服务端并且发出去了**。
+重试的结果是给用户发两遍同样的话 —— 比丢一条更难受，因为丢一条用户会再问一遍。
+
+```python
+except Exception as e:
+    if isinstance(e, socket.timeout) or "timed out" in str(e).lower():
+        log("send timeout（可能已发出，不重试）", who)
+        return False                  # 不重试，只记一笔
+    if i + 1 < tries:                 # 连接失败 / DNS 失败才是真没送到
+        time.sleep(2 + i * 2)
+```
+
+「重试」只在**确定对方没收到**时才有意义。判断不了的时候，宁可不重试。
+
+### 49. SDK 的 `SendMessage` 找不到会话时静默成功
+
+实测：发给一个不存在的会话名，接口回 `{"ok": true}`，微信里什么都没发生，
+**既不抛异常也不返回失败**。所以「ok:true」在发送这一侧最多只能证明「没崩」。
+
+只能在发之前自己核一遍会话是否存在，留个痕迹方便排查：
+
+```csharp
+var vis = await c.GetVisibleConversations();
+if (vis != null && vis.Count > 0 &&
+    !vis.Any(v => (v.ConversationTitle ?? "") == m.who))
+    Console.WriteLine("[send] WARN 目标会话不在可见列表: " + m.who);
+```
+
+**只用它告警，不用它拦截**。`GetVisibleConversations()` 可能有分页，
+真拦下去就是「偶发丢消息」；而漏记一条日志的代价几乎为零。方向要选错得起的那个。
+
+### 50. 发送失败的文件，别扣在 `.claimed` 里
+
+收成品的流程是「扫描 → 改名进 `.claimed` → 发送 → 归档」。
+发送失败时如果只是 `return`，文件就留在了 `.claimed` ——
+而扫描只看 `out/`，那个目录**再也没人扫**，等于永久丢失，用户还以为发出去了。
+
+```python
+if send_files(who, files):
+    archive(files, outdir)
+else:
+    for p in files:
+        dst = os.path.join(outdir, os.path.basename(p))
+        os.replace(p, dst)
+        os.utime(dst, None)     # 必须刷 mtime，否则 since 判断会跳过它
+        back += 1
+    log("OUTBOX putback", who, back)
+```
+
+`.claimed` 这种「中间态目录」只要存在，就必须有一个**把它捞回来**的分支，
+否则它就是个单向垃圾桶。
+
+### 51. 临时目录按次隔离：否则 A 的文件会发给 B
+
+原来是所有请求共用 `<Temp>/wxout`，文件名就是原始文件名。
+两个会话同时发「报告.pdf」时，后写的直接把先写的盖掉 ——
+**结果把 A 的文件发给了 B**。这种 bug 出一次就不敢再用。
+
+```csharp
+string NewWxOutDir()
+{
+    var root = Path.Combine(Path.GetTempPath(), "wxout");
+    Directory.CreateDirectory(root);
+    var cutoff = DateTime.Now.AddHours(-1);          // 顺手清理，否则只涨不降
+    foreach (var d in Directory.GetDirectories(root))
+        if (Directory.GetLastWriteTime(d) < cutoff) Directory.Delete(d, true);
+    var dir = Path.Combine(root, Guid.NewGuid().ToString("N").Substring(0, 12));
+    Directory.CreateDirectory(dir);
+    return dir;
+}
+```
+
+凡是「落盘再发送」的链路，落盘路径都必须带请求唯一性。
+只靠文件名区分是不够的 —— 用户起同名文件太正常了。
+
+### 52. 一个人能占满所有 worker
+
+worker 只有 3 个，队列无上限。一个陌生人连发 20 条，3 个 worker 全在等他，
+主人发来的消息排在后面一起卡 —— 而这台机器是给主人用的。
+
+```python
+MAX_PER_CONV = 3                      # 同一会话最多「排队 + 处理中」3 条
+with _inflight_lock:
+    n = _inflight.get(who, 0)
+    if n >= MAX_PER_CONV:
+        log("DROP", who, "同一会话已积压 %d 条，丢弃这条" % n)
+        return
+    _inflight[who] = n + 1
+```
+
+两个细节：
+- 计数在**入队时**加、在 worker 的 `finally` 里减，不能只在 `handle()` 里加减
+- 被丢弃的消息**游标也要推进**，否则每 0.5 秒重拉同一批，日志刷屏
+
+公平性要靠限流实现，不能靠「反正有队列」——队列没有公平性。
+
+### 53. 读取没有上限，就是给自己埋 OOM
+
+`read()` 一个 200MB 的文本文件，进程直接吃掉 200MB（解码后可能是 400MB）。
+陌生人发什么你都读，等于把内存交给了对方。
+
+```python
+MAX_PARSE_BYTES = 40 * 1024 * 1024    # 先看大小，超了不解析
+MAX_TEXT_READ = 200000                # 再看，就算大小合格也只读这么多字符
+MAX_DOC_CHARS = 8000                  # 真正塞进 prompt 的只有这么多
+```
+
+三层上限各管一件事：**磁盘（不搬）、内存（不读）、上下文（不塞）**。
+少任何一层，另外两层都会被绕过。
+
+顺带一个只增不减的问题：`inbox/` 里的截图和附件从来没人删。
+加个 `prune_inbox()`，每存一个新文件顺手清 7 天前的 —— 目录里文件不多，`listdir` 很便宜。
+
+### 54. 文件名只精确到秒，同一秒两张就互相覆盖
+
+`img_%H%M%S.png` 看着够了，实际上一秒内连截两张（用户连发两张图）就会盖掉一张。
+加上毫秒尾巴，代价是零：
+
+```python
+p = os.path.join(d, "img_%s_%03d.png"
+                 % (time.strftime("%H%M%S"), int(time.time() * 1000) % 1000))
+```
+
+判断标准很简单：**这个文件名会不会被两个人（或两条消息）在同一时刻算出来？**
+会，就得加唯一性。时间戳精确到秒从来都不够。
+
+### 55. `ask()` 失败时，用户那边是彻底的安静
+
+agent 进程崩了、超时了、返回空 —— 桥这边 `reply` 是空字符串，
+然后 `if reply:` 判断为假，什么都不发。用户看到的是「对方已读不回」。
+
+```python
+reply = ask(agent, session, prompt)
+if not reply:                          # 冷启动偶尔会空手而归，先给一次机会
+    time.sleep(2)
+    reply = ask(agent, session, prompt)
+if reply:
+    send_long(who, clean_reply(reply)[:MAX_REPLY])
+else:
+    send_text(who, "我这边刚才卡了一下，没生成出回复。你再说一遍？")
+```
+
+**失败也必须有一条出路**。机器人沉默和机器人卡住，在用户眼里是同一件事，
+但后者至少能让他知道该重发。
