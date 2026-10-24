@@ -113,6 +113,7 @@ object? ReadMember(object o, string name)
 
 var _inbound = new ConcurrentQueue<Inbound>();
 long _seq = 0;
+string _epoch = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmssfff");
 var _seen = new HashSet<string>();
 object _sentLock = new();
 object _seenLock = new();
@@ -791,7 +792,10 @@ app.MapGet("/api/monitor/status", () =>
 app.MapGet("/api/inbound", (long after) =>
 {
     var items = _inbound.Where(x => x.seq > after).OrderBy(x => x.seq).Take(50).ToList();
-    return J(new { ok = true, count = items.Count, last = _seq, items });
+    // epoch = 本进程的启动时间。客户端靠它判断"服务重启了、seq 归零了"，
+    // 而不是靠 last：队列空的时候 last 也是 0，跟重启长得一模一样，
+    // 客户端会被骗着反复把游标重置回 0，然后把整条队列重拉一遍。
+    return J(new { ok = true, count = items.Count, last = _seq, epoch = _epoch, items });
 });
 
 app.MapPost("/api/friend/accept", async () =>

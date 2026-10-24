@@ -799,8 +799,17 @@ def _worker(idx):
 
 def dispatch(it):
     """同一会话固定落一个 worker，保证顺序；不同会话并行。"""
+    global cursor
     who = it.get("who") or ""
     uniq = (it.get("uniq") or "").strip()
+    # 游标必须在这里推进，不能只放在 handle 里：被 dup 挡下的消息不进 handle，
+    # 游标就永远原地不动，于是每 0.5 秒把同一批旧消息重拉一遍、刷一屏 SKIP。
+    try:
+        seq = int(it.get("seq") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    if seq > cursor:
+        cursor = seq
     if seen_before(uniq):
         log("SKIP", who, "dup(after-restart)", repr((it.get("text") or "")[:40]))
         return
@@ -844,26 +853,34 @@ def main():
     log("wxbridge started: vm=%s owner=%s priv=%s chat=%s" % (VM, OWNER, PRIV_AGENT, CHAT_AGENT))
     start_workers()
     fails = 0
-    last_reset_log = 0.0
+    last_reset = 0.0
+    epoch = None            # wxapi 进程代号：只有它变了才是真的重启
     while True:
         try:
             # 10 秒足够：wxapi 那边最慢的一次 GetChatHistory 也就 7 秒。
             # 原来给 30 秒，一旦它线程池被打满，桥会白等半分钟，期间消息全堵着。
             d = api("/api/inbound?after=%d" % cursor, timeout=10)
             fails = 0
-            # wxapi 重启后 seq 会归零，游标必须跟着退回去，否则永远拉不到新消息。
-            # last==0 且队列本来就空时，这里每轮都会成立 —— 只重置游标，日志限流，
-            # 免得刷屏把真正的错误淹掉。重复消费由落盘的去重表兜住。
-            try:
-                last = int(d.get("last") or 0)
-            except (TypeError, ValueError):
-                last = 0
-            if last < cursor:
-                now = time.time()
-                if now - last_reset_log > 60:
-                    last_reset_log = now
-                    log("seq reset: last=%d cursor=%d -> 0" % (last, cursor))
-                cursor = 0
+            # 游标重置只能依据「wxapi 换了个进程」，不能依据 last < cursor：
+            # last 是队列里最后一条的序号，队列空时就是 0，这跟重启长得一模一样。
+            # 拿 last 判断的话，队列一空就会「重置→重拉→再重置」无限循环。
+            ep = d.get("epoch")
+            if ep is not None:
+                if epoch is not None and ep != epoch:
+                    log("wxapi 重启（epoch %s -> %s），游标归零" % (epoch, ep))
+                    cursor = 0
+                epoch = ep
+            else:
+                # 旧版 wxapi 没有 epoch，退回 last 判断，但加 60 秒冷却，
+                # 免得每轮都重置把日志刷满
+                try:
+                    last = int(d.get("last") or 0)
+                except (TypeError, ValueError):
+                    last = 0
+                if last < cursor and time.time() - last_reset > 60:
+                    last_reset = time.time()
+                    log("seq reset（旧版接口）: last=%d cursor=%d -> 0" % (last, cursor))
+                    cursor = 0
             for it in (d.get("items") or []):
                 try:
                     dispatch(it)
