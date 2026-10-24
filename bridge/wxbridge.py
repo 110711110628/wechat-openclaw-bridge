@@ -9,6 +9,7 @@
 import base64
 import queue
 import re
+import zipfile
 import json
 import os
 import subprocess
@@ -24,7 +25,7 @@ OWNER = os.environ.get("WX_OWNER", "主人")
 PRIV_AGENT = os.environ.get("WX_PRIV_AGENT", "owner")
 CHAT_AGENT = os.environ.get("WX_CHAT_AGENT", "chat")
 ACCEPT_INTERVAL = int(os.environ.get("WX_ACCEPT_INTERVAL", "30"))
-POLL_INTERVAL = 1
+POLL_INTERVAL = 0.5
 MAX_REPLY = 1200
 OC = "/home/wechat/.npm-global/bin/openclaw"
 
@@ -121,7 +122,7 @@ GROUP_AGENT = os.environ.get("WX_GROUP_AGENT", "group")
 NL = chr(10)
 
 
-def is_group(who, sender=""):
+def is_group(who, sender="", recent=None):
     """判定是不是群聊。
 
     优先用最可靠的信号：**发言人 != 会话名 → 一定是群**（单聊里 Who 永远等于会话名）。
@@ -135,6 +136,12 @@ def is_group(who, sender=""):
         GROUP_CACHE[who] = True
         log("probe", who, "-> group (by sender=%s)" % snd)
         return True
+    # 只有会话名本人在说话 = 单聊。这条能免掉一次 7~13 秒的全屏探针
+    names = {(m.get("who") or "").strip() for m in (recent or [])} - {""}
+    if len(names) == 1 and who in names:
+        GROUP_CACHE[who] = False
+        log("probe", who, "-> direct (by recent)")
+        return False
     try:
         with UI_LOCK:                      # 读群成员要动微信窗口，不能和截屏抢
             r = api("/api/group/members?name=" + urllib.parse.quote(who), timeout=30)
@@ -380,6 +387,161 @@ def shot_image(who, idx, agent=None):
     return p
 
 
+MAX_DOC_CHARS = 8000
+
+
+def parse_file_name(raw):
+    """微信文件消息的文本长这样：文件 / 文件名 / 150.2K """
+    lines = [x.strip() for x in (raw or "").splitlines() if x.strip()]
+    if len(lines) >= 2 and lines[0] == "文件":
+        return lines[1]
+    return ""
+
+
+def is_file_msg(raw):
+    return bool(parse_file_name(raw))
+
+
+def _office_text(path, low):
+    """docx / pptx / xlsx 都是 zip + xml，用标准库就能把正文抠出来。"""
+    if low.endswith(".docx"):
+        parts = ["word/document.xml"]
+    elif low.endswith(".pptx"):
+        with zipfile.ZipFile(path) as z:
+            parts = sorted(n for n in z.namelist()
+                           if n.startswith("ppt/slides/slide") and n.endswith(".xml"))
+    else:
+        parts = ["xl/sharedStrings.xml"]
+    out = []
+    with zipfile.ZipFile(path) as z:
+        for n in parts:
+            try:
+                xml = z.read(n).decode("utf-8", "replace")
+            except KeyError:
+                continue
+            xml = xml.replace("</w:p>", "\n").replace("</a:p>", "\n").replace("</w:tr>", "\n")
+            out.append(re.sub(r"<[^>]+>", "", xml))
+    return "\n".join(out)
+
+
+def read_document(path):
+    """尽量把文件抽成纯文本；抽不出来返回空串（绝不假装读到了）。"""
+    low = path.lower()
+    try:
+        if low.endswith((".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".html", ".xml", ".yaml", ".yml")):
+            return open(path, encoding="utf-8", errors="replace").read()
+        if low.endswith(".pdf"):
+            r = subprocess.run(["pdftotext", "-layout", "-enc", "UTF-8", path, "-"],
+                               capture_output=True, timeout=90)
+            return (r.stdout or b"").decode("utf-8", "replace")
+        if low.endswith((".docx", ".pptx", ".xlsx")):
+            return _office_text(path, low)
+    except Exception as e:
+        log("read_document error", repr(e)[:140])
+    return ""
+
+
+def fetch_file(who, raw, agent):
+    """文件消息 -> 从微信的接收目录把文件取回来 -> 存进 agent 的 inbox -> 抽文本。
+    微信收到的文件本来就已经落盘在 xwechat_files 里，不用逆向协议。"""
+    name = parse_file_name(raw)
+    if not name:
+        return None
+
+    hit = None
+    for attempt in range(3):                # 刚收到时文件可能还在下载
+        try:
+            d = api("/api/file/find?name=" + urllib.parse.quote(name), timeout=60)
+            items = d.get("items") or []
+            if items:
+                hit = items[0]
+                break
+        except Exception as e:
+            log("file find error", repr(e)[:120])
+        time.sleep(3)
+
+    if not hit:
+        log("FILE not on disk", who, name[:60])
+        return None
+
+    try:
+        g = api("/api/file/get?path=" + urllib.parse.quote(hit["path"]), timeout=300)
+        blob = base64.b64decode(g.get("b64") or "")
+    except Exception as e:
+        log("file get error", repr(e)[:120])
+        return None
+
+    d0 = INBOX_DIRS.get(agent) or INBOX_DIRS.get(PRIV_AGENT) or "/tmp"
+    try:
+        os.makedirs(d0, exist_ok=True)
+        dst = os.path.join(d0, "%d_%s" % (int(time.time()), os.path.basename(hit["name"])))
+        with open(dst, "wb") as f:
+            f.write(blob)
+    except Exception as e:
+        log("file save error", repr(e)[:120])
+        return None
+
+    txt = read_document(dst).strip()
+    log("FILE", who, hit["name"], "%d bytes" % len(blob), "text=%d" % len(txt))
+
+    head = ("（对方发来一个文件：%s，约 %.0fKB，已保存到 %s）"
+            % (hit["name"], len(blob) / 1024.0, dst))
+    if txt:
+        more = "\n…（后面还有，全文就在上面那个路径里）" if len(txt) > MAX_DOC_CHARS else ""
+        return head + "\n文件内容如下：\n" + txt[:MAX_DOC_CHARS] + more
+    return (head + "\n（这个文件我抽不出文字 —— 可能是扫描件、加密 PDF 或者纯图片。"
+            "要处理它就直接用这个路径，别猜内容）")
+
+
+def is_voice_msg(raw):
+    return (raw or "").strip().startswith("语音")
+
+
+def fetch_voice(who, agent=""):
+    """语音消息 -> 微信自带的「转文字」。
+    气泡的 UIA 名字就是「语音2"秒<转录文本>」，没转过的话尾巴是「未播放」，
+    这时让 wxapi 点一下那个自绘的「转文字」按钮再读。"""
+    try:
+        with UI_LOCK:                       # 会切会话 + 点鼠标，必须串行
+            d = api("/api/voice/text?who=%s&wait=8" % urllib.parse.quote(who), timeout=150)
+    except Exception as e:
+        log("voice error", repr(e)[:140])
+        return None
+    t = (d.get("transcript") or "").strip()
+    if not t:
+        log("voice: no transcript", who, (d.get("note") or "")[:80])
+        return None
+    log("VOICE", who, repr(t[:80]))
+    return "（对方发来一条语音，已经转成文字了）语音里说：%s" % t
+
+
+def ctx_from_recent(recent, limit=8):
+    """用 wxapi 随消息一起送来的 recent 拼上下文，省掉一次 7 秒级的读历史。"""
+    lines = []
+    for m in (recent or [])[-limit:]:
+        t = (m.get("text") or "").strip().replace("\n", " ")
+        if not t:
+            continue
+        lines.append(fmt_line(m.get("who") or "", t))
+    return NL.join(lines)
+
+
+def handle_input(who, raw, agent):
+    """把一条微信消息变成能交给 agent 的文本；图片、文件都先落盘。"""
+    t = (raw or "").strip()
+    if is_voice_msg(t):
+        got = fetch_voice(who, agent)
+        if got:
+            return got
+        return decorate(t)                  # 转不出来就如实说听不到
+    if is_file_msg(t):
+        got = fetch_file(who, t, agent)
+        if got:
+            return got
+        return decorate(t)
+    return visual_text(who, t, agent)
+
+
 def visual_text(who, raw, agent=None):
     """图片消息 -> 截屏落盘 -> 给 agent 一个可读的本地路径。
     任何一步失败都退回 decorate 的诚实兜底。"""
@@ -487,7 +649,8 @@ def handle(it):
         return
 
     sender = (it.get("sender") or "").strip()
-    if is_group(who, sender):
+    recent = it.get("recent") or []
+    if is_group(who, sender, recent):
         if sender and sender == BOT_NAME:
             log("SKIP", who, "self-echo", repr(raw[:50]))
             return
@@ -497,9 +660,11 @@ def handle(it):
         speaker = sender or "有人"
         agent = GROUP_AGENT
         session = "agent:%s:wx-%s" % (agent, who)
-        text = visual_text(who, raw, agent)
-        with UI_LOCK:                      # 读历史要动鼠标，全局串行
-            ctx = group_context(who)
+        text = handle_input(who, raw, agent)
+        ctx = ctx_from_recent(recent)      # 优先用随消息带来的，省一次 UIA
+        if not ctx:
+            with UI_LOCK:                  # 兜底才读历史
+                ctx = group_context(who)
         prompt = ("[微信群「%s」里 %s @ 了你]" + NL
                   + "群里最近的对话（格式是「发言人：内容」）：" + NL + "%s" + NL + NL
                   + "刚才 %s @ 你说：%s" + NL + NL
@@ -511,7 +676,7 @@ def handle(it):
     else:
         agent = PRIV_AGENT if who == OWNER else CHAT_AGENT
         session = "agent:%s:wx-%s" % (agent, who)
-        text = visual_text(who, raw, agent)
+        text = handle_input(who, raw, agent)
         if who == OWNER:
             tag = "[微信·主人发来] "
         else:

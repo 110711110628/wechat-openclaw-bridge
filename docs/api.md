@@ -50,9 +50,26 @@
 
 | 方法 | 路径 | 参数 | 说明 |
 |---|---|---|---|
-| GET | `/api/bubbles` | `who` | 枚举消息气泡：`{i, type, cls, name}` |
+| GET | `/api/bubbles` | `who` | 枚举消息气泡：`{i, type, cls, name, x, y, w, h}` |
 | GET | `/api/shot` | `who, index, pad` | **按气泡坐标截屏**，返回 base64 PNG |
 | GET | `/api/image` | `who, index` | 试 `FetchImageAsync` 取原图（多数环境不可用） |
+| GET | `/api/voice/text` | `who, index?, wait?` | **语音转文字**：气泡名里已有转录就直接读，否则点「转文字」再读 |
+| GET | `/api/desc` | `who, index` | 反射枚举某个气泡的所有子孙元素（排查自绘控件用） |
+| GET | `/api/rightclick` | `who, index, pad` | 右键气泡并截取该区域，返回 base64 PNG（排查菜单用） |
+| GET | `/api/key` | `code` | 发一个按键（如 27 = ESC），用来关掉菜单 |
+
+## 文件
+
+| 方法 | 路径 | 参数 | 说明 |
+|---|---|---|---|
+| GET | `/api/file/find` | `name, limit?` | 在 `xwechat_files\*\msg\file\*\` 里按文件名找，按 mtime 倒序 |
+| GET | `/api/file/get` | `path` | 读文件返回 base64；**只允许微信目录下的路径**，单文件上限 30MB |
+
+微信收到的附件本身就已经落盘（见 `docs/pitfalls.md` 38），所以「收文件」只是搜索 + 读取。
+
+`/api/voice/text` 返回 `{ok, clicked, before, transcript, note}`。
+`mmui::ChatVoiceItemView` 的 `Name` 形如 `语音2"秒未播放` 或 `语音2"秒哈喽哈喽，听得到吗？`，
+「秒」后面就是转录文本 —— 有就直接返回，没有才按坐标点那个自绘的「转文字」按钮。
 | GET | `/api/history/deep` | `who, pages, limit` | 滚动翻页读历史，自动重叠合并 |
 
 `/api/shot` 的 `index` 支持负数（`-1` 最后一条，`-2` 倒数第二条），`pad` 是向外扩的像素（默认 4，上限 40）。

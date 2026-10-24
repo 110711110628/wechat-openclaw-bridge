@@ -19,6 +19,13 @@ static extern bool SetCursorPos(int X, int Y);
 [DllImport("user32.dll")]
 static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
 const uint MOUSEEVENTF_WHEEL = 0x0800;
+const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+const uint MOUSEEVENTF_LEFTUP = 0x0004;
+const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+const uint KEYEVENTF_KEYUP = 0x0002;
+[DllImport("user32.dll")]
+static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 SystemParametersInfo(SPI_SETSCREENREADER, 1, IntPtr.Zero, 0x01 | 0x02);
 
 var builder = WebApplication.CreateSlimBuilder(args);
@@ -71,6 +78,23 @@ Array GetItems(object mb)
     return (Array)ip!.GetValue(box)!;
 }
 
+// 把最后几条消息打包给桥做上下文。桥原来要自己再调一次 /api/history（7 秒级），
+// 而这里刚读完全一样的数据，顺手带上就省掉一次全屏 UIA 操作。
+List<object> RecentOf(System.Collections.IEnumerable hist, int n = 6)
+{
+    var all = new List<object>();
+    foreach (var x in hist)
+    {
+        all.Add(new
+        {
+            who = (ReadMember(x, "Who") as string) ?? "",
+            text = (ReadMember(x, "Message") as string) ?? "",
+            time = (ReadMember(x, "SendDateTime") as string) ?? ""
+        });
+    }
+    return all.Count > n ? all.GetRange(all.Count - n, n) : all;
+}
+
 object? ReadMember(object o, string name)
 {
     var t = o.GetType();
@@ -89,6 +113,9 @@ var _monCts = new CancellationTokenSource();
 var _monWho = new List<string>();
 var _seenMax = 20000;
 int _busy = 0;
+// UI 自动化是「单窗口」资源：谁把会话切过去，别人就读到别的聊天。
+// 所有「打开会话 + 读气泡/截图/滚动」的段必须串行。
+var _uiLock = new SemaphoreSlim(1, 1);
 var _sent = new HashSet<string>();
 var _sentQ = new Queue<string>();      // 只用来做 FIFO 淘汰，防止 _sent 无限增长
 const int SENT_MAX = 2000;
@@ -148,6 +175,7 @@ async Task<bool> SubmitMonitor(string who)
         // 启动补扫：把这一次停机期间漏掉的消息补回来。首次运行（seen 为空）只做基线不补发。
         if (who == "*")
         {
+            await _uiLock.WaitAsync();
             try
             {
                 bool baseline = _seen.Count == 0;
@@ -183,7 +211,7 @@ async Task<bool> SubmitMonitor(string who)
                                 bool echo0;
                                 lock (_seenLock) { echo0 = _sent.Contains(txt0); }
                                 if (echo0) continue;
-                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString, (ReadMember(m, "Who") as string) ?? ""));
+                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString, (ReadMember(m, "Who") as string) ?? "", RecentOf(hist)));
                                 Console.WriteLine("[catchup] QUEUED who=" + w + " text=" + txt0);
                             }
                             firstSeen.Add(w);
@@ -196,12 +224,14 @@ async Task<bool> SubmitMonitor(string who)
                 Console.WriteLine("[catchup] done seen=" + _seen.Count);
             }
             catch (Exception ex) { Console.WriteLine("[catchup] error: " + ex.Message); }
+            finally { _uiLock.Release(); }
         }
 
         while (!_monCts.IsCancellationRequested)
         {
             if (Interlocked.CompareExchange(ref _busy, 1, 0) == 0)
             {
+                await _uiLock.WaitAsync();
                 try
                 {
                     var vis = await c.GetVisibleConversations();
@@ -227,7 +257,7 @@ async Task<bool> SubmitMonitor(string who)
                                 bool echo;
                                 lock (_seenLock) { echo = txt.Length > 0 && _sent.Contains(txt); }
                                 if (echo) continue;
-                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString, (ReadMember(m, "Who") as string) ?? ""));
+                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString, (ReadMember(m, "Who") as string) ?? "", RecentOf(hist)));
                                 Console.WriteLine("[poll] QUEUED seq=" + _seq + " who=" + w + " text=" + (m.Message ?? ""));
                             }
                             firstSeen.Add(w);
@@ -241,9 +271,9 @@ async Task<bool> SubmitMonitor(string who)
                     }
                 }
                 catch (Exception ex) { Console.WriteLine("[poll] error: " + ex.Message); }
-                finally { Interlocked.Exchange(ref _busy, 0); }
+                finally { _uiLock.Release(); Interlocked.Exchange(ref _busy, 0); }
             }
-            try { await Task.Delay(1000, _monCts.Token); } catch { break; }
+            try { await Task.Delay(300, _monCts.Token); } catch { break; }
         }
     });
     return true;
@@ -363,6 +393,310 @@ app.MapGet("/api/search", async (string who) =>
         var c = C();
         var r = await c.SearchFriend(who);
         return J(new { ok = true, found = r });
+    }
+    catch (Exception ex) { return ERR(ex); }
+});
+
+// ---- 微信收到的文件其实已经落盘了，直接去磁盘上找，不用逆向 ----
+string WxFileRoot()
+{
+    var env = Environment.GetEnvironmentVariable("WX_FILE_ROOT");
+    if (!string.IsNullOrWhiteSpace(env)) return env;
+    var doc = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+    return Path.Combine(doc, "xwechat_files");
+}
+
+app.MapGet("/api/file/find", (string name, int? limit) =>
+{
+    try
+    {
+        var root = WxFileRoot();
+        if (!Directory.Exists(root))
+            return J(new { ok = false, error = "root not found", root });
+        var key = (name ?? "").Trim();
+        if (key.Length == 0) return J(new { ok = false, error = "name required" });
+
+        int lim = Math.Clamp(limit ?? 10, 1, 50);
+        var hits = new List<(string path, string name, long size, string mtime)>();
+        // 只看最近 4 个月目录，避免全盘扫
+        var months = Directory.GetDirectories(root, "*", SearchOption.AllDirectories)
+            .Where(d => d.Contains("\\msg\\file\\") || d.Contains("\\msg\\attach\\"))
+            .OrderByDescending(d => d)
+            .Take(8)
+            .ToList();
+        foreach (var d in months)
+        {
+            IEnumerable<string> fs;
+            try { fs = Directory.GetFiles(d); } catch { continue; }
+            foreach (var f in fs)
+            {
+                var fn = Path.GetFileName(f);
+                if (fn.IndexOf(key, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                var fi = new FileInfo(f);
+                hits.Add((f, fn, fi.Length, fi.LastWriteTime.ToString("s")));
+            }
+        }
+        var list = hits.OrderByDescending(x => x.mtime).Take(lim)
+                       .Select(x => new { path = x.path, name = x.name, size = x.size, mtime = x.mtime })
+                       .ToList();
+        return J(new { ok = true, root, count = list.Count, items = list });
+    }
+    catch (Exception ex) { return ERR(ex); }
+});
+
+app.MapGet("/api/file/get", (string path) =>
+{
+    try
+    {
+        var root = Path.GetFullPath(WxFileRoot());
+        var full = Path.GetFullPath(path ?? "");
+        if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            return J(new { ok = false, error = "只允许读微信目录下的文件" });
+        if (!File.Exists(full)) return J(new { ok = false, error = "not found" });
+        var fi = new FileInfo(full);
+        if (fi.Length > 30 * 1024 * 1024) return J(new { ok = false, error = "文件超过 30MB" });
+        var b64 = Convert.ToBase64String(File.ReadAllBytes(full));
+        return J(new { ok = true, name = fi.Name, size = fi.Length, b64 });
+    }
+    catch (Exception ex) { return ERR(ex); }
+});
+
+// ---- 右键气泡并截图，用来肉眼确认菜单里有什么 ----
+// ---- 语音转文字 ----
+// 微信气泡里的「转文字」是 mmui 自绘的，UIA 里查不到（子孙元素为 0），
+// 只能按气泡坐标点：那一行里转文字按钮正好落在矩形横向 50% 的位置。
+app.MapGet("/api/voice/text", async (string who, int? index, int? wait) =>
+{
+    await _uiLock.WaitAsync();
+    try
+    {
+        var c = C();
+        if (!string.IsNullOrWhiteSpace(who))
+        {
+            try { await c.GetChatHistory(who, DateTime.Today); } catch { }
+            await Task.Delay(500);
+        }
+        try { await c.Focus(); await Task.Delay(300); } catch { }
+
+        // 气泡名字列表：用「名字差集」判断转录结果，比下标可靠（点击后列表会位移）
+        List<string> Names()
+        {
+            var its = GetItems(GetMB(c));
+            var l = new List<string>();
+            for (int i = 0; i < its.Length; i++)
+                l.Add(((ReadMember(its.GetValue(i)!, "Name") as string) ?? "").Trim());
+            return l;
+        }
+
+        var items = GetItems(GetMB(c));
+        if (items.Length == 0) return J(new { ok = false, error = "no bubbles" });
+
+        int idx = -1;
+        if (index.HasValue)
+        {
+            idx = index.Value < 0 ? items.Length + index.Value : index.Value;
+        }
+        else
+        {
+            for (int i = items.Length - 1; i >= 0; i--)
+            {
+                var cl0 = (ReadMember(items.GetValue(i)!, "ClassName") as string) ?? "";
+                if (cl0.Contains("Voice")) { idx = i; break; }
+            }
+        }
+        if (idx < 0 || idx >= items.Length) return J(new { ok = false, error = "no voice bubble" });
+
+        var rc = ReadMember(items.GetValue(idx)!, "BoundingRectangle");
+        int x = Convert.ToInt32(ReadMember(rc, "X") ?? 0);
+        int y = Convert.ToInt32(ReadMember(rc, "Y") ?? 0);
+        int w = Convert.ToInt32(ReadMember(rc, "Width") ?? 0);
+        int h = Convert.ToInt32(ReadMember(rc, "Height") ?? 0);
+        if (w <= 0 || h <= 0) return J(new { ok = false, error = "bad rect" });
+
+        var beforeNames = Names();
+        string before = idx < beforeNames.Count ? beforeNames[idx] : "";
+        int secs = Math.Clamp(wait ?? 8, 2, 20);
+        string transcript = "";
+        int usedX = 0;
+
+        // 「秒」后面就是内容：语音2"秒哈喽哈喽，听得到吗？
+        string TailOf(string nm)
+        {
+            var k = (nm ?? "").IndexOf("秒");
+            if (k < 0) return "";
+            var t = nm.Substring(k + 1).Trim();
+            if (t.StartsWith("未播放")) t = t.Substring(3).Trim();
+            return t;
+        }
+
+        transcript = TailOf(before);
+        if (transcript.Length > 0)
+            return J(new { ok = true, clicked = new { x = 0, y = 0 }, before, transcript, note = "这条已经转过了，直接读的名字" });
+
+        // 悬停才显出「转文字」，位置大约在整行宽度的 50%~58%
+        foreach (var f in new double[] { 0.52, 0.58, 0.46 })
+        {
+            int cx = x + (int)(w * f);
+            int cy = y + h / 2;
+            usedX = cx;
+            SetCursorPos(cx, cy);
+            await Task.Delay(400);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+            await Task.Delay(60);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+
+            for (int t = 0; t < secs * 2; t++)
+            {
+                await Task.Delay(500);
+                List<string> now;
+                try { now = Names(); } catch { continue; }
+                foreach (var nm in now)
+                {
+                    if (string.IsNullOrWhiteSpace(nm)) continue;
+                    if (beforeNames.Contains(nm)) continue;
+                    var tl = TailOf(nm);
+                    if (tl.Length > 0) { transcript = tl; break; }
+                }
+                if (transcript.Length > 0) break;
+            }
+            if (transcript.Length > 0) break;
+        }
+
+        return J(new
+        {
+            ok = transcript.Length > 0,
+            clicked = new { x = usedX, y = y + h / 2 },
+            before,
+            transcript,
+            note = transcript.Length > 0 ? "" : "点了没等到转录文本（可能是纯音乐、静音，或按钮位置变了）"
+        });
+    }
+    catch (Exception ex) { return ERR(ex); }
+    finally { _uiLock.Release(); }
+});
+
+// 反射枚举子孙元素：语音气泡旁边那个「转文字」到底是不是 UIA 元素，靠这个确认
+app.MapGet("/api/desc", async (string who, int? index, int? depth) =>
+{
+    await _uiLock.WaitAsync();
+    try
+    {
+        var c = C();
+        if (!string.IsNullOrWhiteSpace(who))
+        {
+            try { await c.GetChatHistory(who, DateTime.Today); } catch { }
+            await Task.Delay(500);
+        }
+        var items = GetItems(GetMB(c));
+        if (items.Length == 0) return J(new { ok = false, error = "no bubbles" });
+        int idx0 = index ?? -1;
+        int idx = idx0 < 0 ? items.Length + idx0 : idx0;
+        if (idx < 0 || idx >= items.Length) return J(new { ok = false, error = "index out of range" });
+
+        var root = items.GetValue(idx)!;
+        int maxDepth = Math.Clamp(depth ?? 2, 1, 4);
+        var outp = new List<object>();
+        var mFindAll = root.GetType().GetMethod("FindAllDescendants", Type.EmptyTypes);
+        if (mFindAll == null) return J(new { ok = false, error = "no FindAllDescendants" });
+        var kids = (System.Collections.IEnumerable?)mFindAll.Invoke(root, null);
+        if (kids != null)
+        {
+            int n = 0;
+            foreach (var k in kids)
+            {
+                if (k == null) continue;
+                if (++n > 80) break;
+                var rc = ReadMember(k, "BoundingRectangle");
+                outp.Add(new
+                {
+                    cls = ReadMember(k, "ClassName") as string ?? "",
+                    name = ((ReadMember(k, "Name") as string) ?? "").Trim(),
+                    type = ReadMember(k, "ControlType")?.ToString() ?? "",
+                    x = Convert.ToInt32(ReadMember(rc, "X") ?? 0),
+                    y = Convert.ToInt32(ReadMember(rc, "Y") ?? 0),
+                    w = Convert.ToInt32(ReadMember(rc, "Width") ?? 0),
+                    h = Convert.ToInt32(ReadMember(rc, "Height") ?? 0)
+                });
+            }
+        }
+        var rct = ReadMember(root, "BoundingRectangle");
+        return J(new
+        {
+            ok = true,
+            owner = new
+            {
+                cls = ReadMember(root, "ClassName") as string ?? "",
+                name = ((ReadMember(root, "Name") as string) ?? "").Trim(),
+                x = Convert.ToInt32(ReadMember(rct, "X") ?? 0),
+                y = Convert.ToInt32(ReadMember(rct, "Y") ?? 0),
+                w = Convert.ToInt32(ReadMember(rct, "Width") ?? 0),
+                h = Convert.ToInt32(ReadMember(rct, "Height") ?? 0)
+            },
+            count = outp.Count,
+            kids = outp
+        });
+    }
+    catch (Exception ex) { return ERR(ex); }
+    finally { _uiLock.Release(); }
+});
+
+app.MapGet("/api/rightclick", async (string who, int? index, int? pad) =>
+{
+    await _uiLock.WaitAsync();
+    try
+    {
+        var c = C();
+        if (!string.IsNullOrWhiteSpace(who))
+        {
+            try { await c.GetChatHistory(who, DateTime.Today); } catch { }
+            await Task.Delay(500);
+        }
+        try { await c.Focus(); await Task.Delay(500); } catch { }
+
+        var items = GetItems(GetMB(c));
+        if (items.Length == 0) return J(new { ok = false, error = "no bubbles" });
+        int idx0 = index ?? -1;
+        int idx = idx0 < 0 ? items.Length + idx0 : idx0;
+        if (idx < 0 || idx >= items.Length) return J(new { ok = false, error = "index out of range" });
+
+        var rect = ReadMember(items.GetValue(idx)!, "BoundingRectangle");
+        int x = Convert.ToInt32(ReadMember(rect, "X") ?? 0);
+        int y = Convert.ToInt32(ReadMember(rect, "Y") ?? 0);
+        int w = Convert.ToInt32(ReadMember(rect, "Width") ?? 0);
+        int h = Convert.ToInt32(ReadMember(rect, "Height") ?? 0);
+        if (w <= 0 || h <= 0) return J(new { ok = false, error = "bad rect" });
+
+        int cx = x + w / 2, cy = y + h / 2;
+        SetCursorPos(cx, cy);
+        await Task.Delay(150);
+        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, UIntPtr.Zero);
+        await Task.Delay(60);
+        mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, UIntPtr.Zero);
+        await Task.Delay(700);
+
+        int px = pad ?? 420;
+        int sx = Math.Max(0, cx - px / 3);
+        int sy = Math.Max(0, cy - px / 3);
+        int sw = Math.Min(px, Math.Max(200, 1920 - sx));
+        int sh = Math.Min(px, Math.Max(200, 1080 - sy));
+        using var bmp = new System.Drawing.Bitmap(sw, sh, System.Drawing.Imaging.PixelFormat.Format24bppRgb);
+        using (var g = System.Drawing.Graphics.FromImage(bmp))
+            g.CopyFromScreen(sx, sy, 0, 0, new System.Drawing.Size(sw, sh));
+        using var ms = new MemoryStream();
+        bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+        return J(new { ok = true, x = cx, y = cy, sx, sy, sw, sh, png = Convert.ToBase64String(ms.ToArray()) });
+    }
+    catch (Exception ex) { return ERR(ex); }
+    finally { _uiLock.Release(); }
+});
+
+app.MapGet("/api/key", (int code) =>
+{
+    try
+    {
+        keybd_event((byte)code, 0, 0, UIntPtr.Zero);
+        keybd_event((byte)code, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+        return J(new { ok = true, vk = code });
     }
     catch (Exception ex) { return ERR(ex); }
 });
@@ -531,6 +865,7 @@ app.MapPost("/api/group/quit", async (GQ g) =>
 
 app.MapGet("/api/bubbles", async (string who) =>
 {
+    await _uiLock.WaitAsync();
     try
     {
         var c = C();
@@ -550,11 +885,17 @@ app.MapGet("/api/bubbles", async (string who) =>
             string ct = "";
             try { ct = ReadMember(it, "ControlType")?.ToString() ?? ""; } catch { }
             if (nm.Length > 200) nm = nm.Substring(0, 200);
-            list.Add(new { i, type = ct, cls, name = nm });
+            var rc = ReadMember(it, "BoundingRectangle");
+            int rx = Convert.ToInt32(ReadMember(rc, "X") ?? 0);
+            int ry = Convert.ToInt32(ReadMember(rc, "Y") ?? 0);
+            int rw = Convert.ToInt32(ReadMember(rc, "Width") ?? 0);
+            int rh = Convert.ToInt32(ReadMember(rc, "Height") ?? 0);
+            list.Add(new { i, type = ct, cls, name = nm, x = rx, y = ry, w = rw, h = rh });
         }
         return J(new { ok = true, count = items.Length, items = list });
     }
     catch (Exception ex) { return ERR(ex); }
+    finally { _uiLock.Release(); }
 });
 
 app.MapGet("/api/image", async (string who, int? index) =>
@@ -619,6 +960,7 @@ app.MapGet("/api/image", async (string who, int? index) =>
 
 app.MapGet("/api/shot", async (string who, int? index, int? pad) =>
 {
+    await _uiLock.WaitAsync();
     try
     {
         var c = C();
@@ -683,10 +1025,12 @@ app.MapGet("/api/shot", async (string who, int? index, int? pad) =>
         });
     }
     catch (Exception ex) { return ERR(ex); }
+    finally { _uiLock.Release(); }
 });
 
 app.MapGet("/api/history/deep", async (string who, int? pages, int? limit) =>
 {
+    await _uiLock.WaitAsync();
     try
     {
         var c = C();
@@ -793,6 +1137,7 @@ app.MapGet("/api/history/deep", async (string who, int? pages, int? limit) =>
         });
     }
     catch (Exception ex) { return ERR(ex); }
+    finally { _uiLock.Release(); }
 });
 
 app.MapPost("/api/upload", async (U u) =>
@@ -884,7 +1229,7 @@ record MQ(string who);
 record GC(string name, string firstWho, string[] members);
 record GI(string name, string[] members, string reason);
 record GQ(string name, bool clearHistory);
-record Inbound(long seq, string who, string text, string time, string uniq, string sender);
+record Inbound(long seq, string who, string text, string time, string uniq, string sender, List<object> recent);
 record U(string name, string data);
 record UF(string name, string data);
 record US(string who, UF[] files);
