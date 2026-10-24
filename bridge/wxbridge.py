@@ -1061,10 +1061,16 @@ def handle(it):
     t0 = time.time()
 
     # 短消息先分诊。一句「在吗」也走完整条 agent 链路（3 秒起步）太浪费，
-    # 而这类消息恰恰是最多的。长消息不问，直接进 agent —— 路由也要花 0.4 秒，
+    # 而这类消息恰恰是最多的。长消息不问，直接进 agent —— 路由也要花 1 秒，
     # 对复杂请求就是纯亏。
+    #
+    # ⚠️ 只给访客（CHAT_AGENT）用，主人不走这条路，两个原因：
+    #   1) 分诊的 skip 回复是**无状态**的，不进会话历史 —— 主人回头问「刚才说什么」
+    #      会对不上；访客没有跨轮上下文，无所谓
+    #   2) 主人那句「重启下 nginx」只有 7 个字，但它是真指令，不该被降级成无思考
     think = None
-    if ROUTER_ON and not in_group and len(raw) <= ROUTE_MAXLEN and not is_file_msg(raw):
+    if (ROUTER_ON and agent == CHAT_AGENT and len(raw) <= ROUTE_MAXLEN
+            and not is_file_msg(raw)):
         r = route_short(raw)
         if r and r[0] == "skip" and r[1]:
             send_long(who, r[1][:120])
