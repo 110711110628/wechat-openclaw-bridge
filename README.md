@@ -10,6 +10,13 @@
 
 ![architecture](assets/architecture.svg)
 
+> **English TL;DR** — A self-hosted bridge that turns a real WeChat 4.x client into an
+> AI agent endpoint. No memory injection, no protocol reverse engineering: it drives the
+> official client purely through Windows UI Automation. Two components: `wxapi` (ASP.NET
+> Core, runs in a Windows VM) and `wxbridge` (Python, runs on the machine hosting your
+> OpenClaw agents). Supports text + file both ways, per-agent permission tiers, screenshot
+> based image reading, deep history paging, and a watchdog that restarts a wedged service.
+
 ---
 
 ## 它解决什么问题
