@@ -15,7 +15,16 @@ Environment=WX_CHAT_AGENT=chat
 Environment=WX_GROUP_AGENT=group
 Environment=WX_BOT_NAME=OpenClaw
 Environment=WX_FAIL_LIMIT=4
-ExecStart=/usr/bin/python3 /opt/wxbridge/wxbridge.py
+# 短消息分诊（1 秒内判断寒暄/普通/深度）。设 0 关掉，关掉只是多花几秒，不影响正确性。
+Environment=WX_ROUTER=1
+# 超过这么多秒还没出结果，先回一句「在处理」。群里不发。
+Environment=WX_ACK_DELAY=8
+# ⚠️ 必须用装了 python-docx 的解释器。系统 Python 被 PEP 668 锁住装不了包，
+#    所以 .docx 依赖一个 venv：
+#      python3 -m venv /opt/wxbridge/.venv && /opt/wxbridge/.venv/bin/pip install python-docx
+#    用 /usr/bin/python3 也能跑，但 [[FILE: xxx.docx]] 会静默降级成 .md —— 不报错，只是格式不对。
+#    不想建 venv 也行，把需求改成 .md 就好，别留着不装又指望出 word。
+ExecStart=/opt/wxbridge/.venv/bin/python /opt/wxbridge/wxbridge.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

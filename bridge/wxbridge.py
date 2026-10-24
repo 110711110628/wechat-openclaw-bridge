@@ -164,14 +164,14 @@ def find_terminal(o):
     return None
 
 
-def ask(agent, session, text):
+def ask(agent, session, text, thinking=None):
     cmd = [OC, "agent", "--agent", agent, "--session-key", session,
            "-m", text, "--json", "--timeout", "180"]
     # 思考档位直接影响等待时间（实测同一句话：默认 2.5s，off 1.9s，
     # 而且尾部从 3.4s 收到 1.9s —— 用户感受到的是尾部，不是中位数）。
     # 只有「闲聊」和「群里有问就答」敢关；主人那台是全权 agent，要调工具、要看文件，
     # 思考留着，慢一点换正确率，慢的那部分靠「处理中」提示兜住。
-    th = THINKING.get(agent)
+    th = THINKING.get(agent) if thinking is None else thinking
     if th:
         cmd += ["--thinking", th]
     try:
@@ -669,6 +669,209 @@ def ctx_from_recent(recent, limit=8):
     return NL.join(lines)
 
 
+# ── 文档生成 ───────────────────────────────────────────────────
+# 陌生人和群里的 agent **没有文件系统权限**，这是故意的：给了 write 就等于把服务器
+# 交出去 —— 它能把 openclaw.json 改了给自己开 exec，能覆盖 ~/.ssh/authorized_keys。
+# 所以让它们只「输出内容」，落盘这一步由桥来做，路径/扩展名/大小全在桥这边卡。
+FILE_BLOCK = re.compile(r"\[\[\s*FILE:\s*([^\]\n]{1,80}?)\s*\]\]\s*(.*?)\s*\[\[\s*/FILE\s*\]\]",
+                        re.S)
+ALLOW_EXT = {".md", ".txt", ".csv", ".html", ".htm", ".json", ".docx"}
+MAX_FILE_TEXT = 200000
+DOC_DIRS = OUT_DIRS
+
+
+def _safe_filename(raw):
+    """模型给的文件名一律当不可信输入：去路径、去非法字符、限定扩展名。
+
+    不用 os.path.basename —— 它在 Windows 上会把 `c:xxx` 当盘符拆掉，
+    在 Linux 上又不拆，同一份代码两种行为。自己按 `/` 切，结果是确定的。
+    """
+    n = (raw or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    n = re.sub(r'[<>:"|?*\x00-\x1f]', "_", n).strip(" .")
+    if not n:
+        return ""
+    base, ext = os.path.splitext(n)
+    if ext.lower() not in ALLOW_EXT:
+        base, ext = (base or n), ".md"
+    base = base[:60].strip(" .") or "文件"
+    return base + ext.lower()
+
+
+def write_docx(path, text):
+    """把模型给的 Markdown 写成 .docx：标题 / 列表 / 表格 / 正文四类，够用就行。
+
+    只保证「结构对、能打印」，不做花哨排版 —— 精细排版得先有模板，这里没有。
+    """
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        from docx.oxml.ns import qn
+    except ImportError:
+        return False
+    doc = Document()
+    st = doc.styles["Normal"]
+    st.font.name = "Microsoft YaHei"
+    st.font.size = Pt(10.5)
+    st.element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        # 表格：连续的 | 行，第二行是分隔线
+        if s.startswith("|") and s.endswith("|") and i + 1 < len(lines):
+            nxt = lines[i + 1].strip()
+            if nxt.startswith("|") and set(nxt.replace("|", "").strip()) <= set("-: "):
+                rows = []
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                    if not all(c and set(c) <= set("-: ") for c in cells):
+                        rows.append(cells)
+                    i += 1
+                if rows:
+                    cols = max(len(r) for r in rows)
+                    t = doc.add_table(rows=len(rows), cols=cols)
+                    t.style = "Table Grid"
+                    for ri, r in enumerate(rows):
+                        for ci in range(cols):
+                            t.cell(ri, ci).text = r[ci] if ci < len(r) else ""
+                continue
+        if not s:
+            i += 1
+            continue
+        if s.startswith("#"):
+            lvl = min(len(s) - len(s.lstrip("#")), 4)
+            doc.add_heading(s.lstrip("#").strip(), level=max(1, lvl))
+        elif s.startswith(("- ", "* ")):
+            doc.add_paragraph(s[2:].strip(), style="List Bullet")
+        elif re.match(r"^\d+[.、)]\s+", s):
+            doc.add_paragraph(re.sub(r"^\d+[.、)]\s+", "", s), style="List Number")
+        else:
+            doc.add_paragraph(s)
+        i += 1
+    doc.save(path)
+    return True
+
+
+def take_files(reply, outdir):
+    """把回复里的 [[FILE: 名字]]…[[/FILE]] 落盘，返回 (去掉文件块的正文, 文件路径表)。"""
+    if not outdir or "[[FILE:" not in reply.replace(" ", ""):
+        return reply, []
+    made = []
+    for m in FILE_BLOCK.finditer(reply):
+        name = _safe_filename(m.group(1))
+        body = (m.group(2) or "").strip()
+        if not name or not body:
+            continue
+        if len(body) > MAX_FILE_TEXT:
+            body = body[:MAX_FILE_TEXT]
+        try:
+            os.makedirs(outdir, exist_ok=True)
+            p = os.path.join(outdir, name)
+            if name.lower().endswith(".docx") and write_docx(p, body):
+                pass
+            elif name.lower().endswith(".docx"):
+                # 没装 python-docx 就退成 .md，别给用户一个坏文件
+                p = os.path.splitext(p)[0] + ".md"
+                with open(p, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(body)
+            else:
+                with open(p, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(body)
+            made.append(p)
+            log("DOC", os.path.basename(p), len(body))
+        except Exception as e:
+            log("DOC error", name, repr(e)[:120])
+    return FILE_BLOCK.sub("", reply).strip(), made
+
+
+# ── 分诊器 ─────────────────────────────────────────────────────
+# 一句「在吗」也要走完整条 agent 链路（3 秒起步），太浪费。
+# 先花 0.3~0.5 秒问一个便宜模型「这条该走哪条路」，短消息才问，长消息直接进 agent。
+OPENCLAW_JSON = os.environ.get("WX_OPENCLAW_JSON",
+                               "/home/wechat/.openclaw/openclaw.json")
+ROUTER_ON = os.environ.get("WX_ROUTER", "1") == "1"
+ROUTE_MAXLEN = int(os.environ.get("WX_ROUTE_MAXLEN", "16"))
+
+ROUTE_PROMPT = (
+    "你是微信消息分诊器，只分类，不聊天。只输出一行 JSON：\n"
+    '{"route":"skip|chat|deep","reply":"..."}\n'
+    "- skip：纯寒暄、道谢、确认收到（在吗/你好/好的/谢谢/收到/嗯）。"
+    "此时 reply 给一句自然的回应，12 字以内，像真人随口回的那种。\n"
+    "- chat：普通问答、闲聊、要整理成一份文档。\n"
+    "- deep：要查资料、要多步处理、要分析文件内容、要写代码。\n"
+    "拿不准就填 chat。只输出 JSON。"
+)
+
+
+def _llm_cfg():
+    """从 openclaw 配置里取 provider 的 base/key/模型。只读，不改。"""
+    try:
+        with open(OPENCLAW_JSON, encoding="utf-8") as f:
+            c = json.load(f)
+        for _name, p in (c.get("models", {}).get("providers") or {}).items():
+            ms = p.get("models") or []
+            if p.get("baseUrl") and p.get("apiKey") and ms:
+                return p["baseUrl"].rstrip("/"), p["apiKey"], (ms[0].get("id") or "")
+    except Exception as e:
+        log("router cfg error", repr(e)[:100])
+    return None
+
+
+def route_short(text):
+    """返回 ('skip'|'chat'|'deep', reply)。失败返回 None —— 路由是优化项，不能当单点。"""
+    cfg = _llm_cfg()
+    if not cfg:
+        return None
+    base, key, model = cfg
+    # max_tokens 不能给 40 —— 这个模型是 reasoning 模型，40 个 token 全花在
+    # reasoning_content 上就被截断了，content 是空的、finish_reason=length，
+    # 表现为「分诊器对正经问题永远失败、只对寒暄成功」。实测 200 和 40 的
+    # 延迟差只有 0.02 秒（1.08 vs 1.10），别在这省。
+    body = json.dumps({"model": model, "temperature": 0, "max_tokens": 200,
+                       "messages": [{"role": "system", "content": ROUTE_PROMPT},
+                                    {"role": "user", "content": text}]}).encode()
+    req = urllib.request.Request(base + "/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + key})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        ch = d["choices"][0]
+        txt = (ch.get("message") or {}).get("content") or ""
+        obj = _first_json_obj(txt)
+        if obj is None:
+            # 截断 / 空内容 / 全是解释性文字，都走这里。降级即可，别抛。
+            log("router noise", ch.get("finish_reason"), repr(txt[:60]))
+            return None
+        rt = (obj.get("route") or "").strip().lower()
+        if rt in ("skip", "chat", "deep"):
+            log("ROUTE", rt, "%.2fs" % (time.time() - t0), repr(text[:20]))
+            return rt, (obj.get("reply") or "").strip()
+    except Exception as e:
+        log("router error", repr(e)[:100])
+    return None
+
+
+def _first_json_obj(txt):
+    """从模型输出里捞出第一个合法 JSON 对象。
+
+    不能简单用 txt[find('{'):rfind('}')+1] —— 这个模型偶尔会把同一行
+    JSON 重复输出两三遍（{"route":...}{"route":...}），首尾一框就是非法
+    JSON，正是分诊器曾经对正常问题全部失败的直接原因。
+    """
+    if not txt:
+        return None
+    for m in re.finditer(r"\{[^{}]*\}", txt):
+        try:
+            obj = json.loads(m.group(0))
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("route"):
+            return obj
+    return None
+
+
 def handle_input(who, raw, agent):
     """把一条微信消息变成能交给 agent 的文本；图片、文件都先落盘。"""
     t = (raw or "").strip()
@@ -857,6 +1060,21 @@ def handle(it):
     outdir = OUT_DIRS.get(agent)
     t0 = time.time()
 
+    # 短消息先分诊。一句「在吗」也走完整条 agent 链路（3 秒起步）太浪费，
+    # 而这类消息恰恰是最多的。长消息不问，直接进 agent —— 路由也要花 0.4 秒，
+    # 对复杂请求就是纯亏。
+    think = None
+    if ROUTER_ON and not in_group and len(raw) <= ROUTE_MAXLEN and not is_file_msg(raw):
+        r = route_short(raw)
+        if r and r[0] == "skip" and r[1]:
+            send_long(who, r[1][:120])
+            log("ROUTER skip", who, "%.1fs" % (time.time() - t0), repr(r[1][:30]))
+            return
+        if r:
+            think = "" if r[0] == "deep" else "off"
+
+    _busy_hint[who] = raw[:40]
+
     # 「处理中」提示：agent 一个回合要 5 秒，带工具时能干到 90 秒。
     # 这段时间聊天窗口里一点动静都没有，用户会以为消息没发出去 / 被无视了。
     # 超过 ACK_DELAY 还没出结果就先说一句，出了结果再发真正的回复。
@@ -879,7 +1097,7 @@ def handle(it):
         timer.start()
 
     try:
-        reply = ask(agent, session, prompt)
+        reply = ask(agent, session, prompt, thinking=think)
         if not reply:
             # 重试要看「怎么失败的」：快速失败（网关抖一下、模型空手）重试很有用；
             # 如果是跑满 180 秒超时才失败，再重试就是让用户再等三分钟 ——
@@ -888,7 +1106,7 @@ def handle(it):
             if took < 25:
                 log("no reply after %.0fs, retry once" % took, who)
                 time.sleep(2)
-                reply = ask(agent, session, prompt)
+                reply = ask(agent, session, prompt, thinking=think)
             else:
                 log("no reply after %.0fs, too slow to retry" % took, who)
     finally:
@@ -896,10 +1114,15 @@ def handle(it):
             ack["done"] = True
         if timer:
             timer.cancel()
+        _busy_hint.pop(who, None)
 
     log("ELAPSED", who, "%.1fs" % (time.time() - t0))
     if reply:
         reply = clean_reply(reply)[:MAX_REPLY]
+        # 文档走协议：agent 只输出内容，落盘由桥做（它自己没有文件系统权限）
+        reply, docs = take_files(reply, outdir)
+        if not reply and docs:
+            reply = "文件发你了。"
         if reply:
             send_long(who, reply)
     else:
@@ -952,6 +1175,47 @@ def _worker(idx):
 MAX_PER_CONV = 3
 _inflight = {}
 _inflight_lock = threading.Lock()
+_busy_hint = {}          # who -> 正在处理的那条消息，插话的模型要知道在等什么
+_side_busy = set()       # 正在回插话的会话，同一会话只允许一条，别自己堆起来
+_side_lock = threading.Lock()
+
+
+def side_answer(who, raw, hint):
+    """会话正忙时插一句：先回答对方这条，别让他盯着「正在输入」干等。
+
+    为什么单开一条线程、单开一个 session-key：
+      · 走主队列要排在长任务后面，等于没做
+      · 用主 session 会和正在跑的回合抢上下文（同一个 key 并发写，先乱的是历史）
+    所以给它一个 `<who>-side` 的独立会话，没有工具、思考关掉，两句话就完。
+    """
+    with _side_lock:
+        if who in _side_busy or len(_side_busy) >= 3:
+            log("SIDE skip", who, "已有一条插话在处理")
+            return
+        _side_busy.add(who)
+    try:
+        sess = "agent:%s:wx-%s-side" % (CHAT_AGENT, who)
+        q = ("[插话] 对方在等你手上这件事的结果（%s），又发来一条：%s\n\n"
+             "用一两句直接回应这条：是问题就直接答；是新任务就说手头这件马上完、"
+             "完了接着弄，并把他要的事复述一遍。"
+             "不要提你在处理什么细节，不要客套，不要问「还需要什么」。"
+             # 实测它会顺手编一个城市出来（问天气就答「北京明天」），
+             # 这种细节猜错比不答更难看，明写一句堵住。
+             "不知道的细节（城市、日期、数字、人名）绝对不要猜，"
+             "要么反问一句，要么说稍后确认。"
+             % (hint or "正在处理", raw[:200]))
+        t0 = time.time()
+        r = ask(CHAT_AGENT, sess, q, thinking="off")
+        if r:
+            r = clean_reply(r)[:400]
+            if r:
+                send_long(who, r)
+                log("SIDE answered", who, "%.1fs" % (time.time() - t0), repr(r[:50]))
+    except Exception as e:
+        log("SIDE error", repr(e)[:120])
+    finally:
+        with _side_lock:
+            _side_busy.discard(who)
 
 
 def dispatch(it):
@@ -976,11 +1240,20 @@ def dispatch(it):
             log("DROP", who, "同一会话已积压 %d 条，丢弃这条" % n,
                 repr((it.get("text") or "")[:40]))
             return
-        _inflight[who] = n + 1
+        if n == 0:
+            _inflight[who] = 1        # 只有真正进队列的才占名额
     # 入队就占位：同一批 items 里若有同一条消息的重复，后面那条立刻被挡住
     mark_seen(uniq)
-    idx = abs(hash(who)) % WORKERS
-    _queues[idx].put(it)
+    if n == 0:
+        idx = abs(hash(who)) % WORKERS
+        _queues[idx].put(it)
+        return
+    # 会话正忙 —— 走「插话」通道立刻回一句，别让他排在那件长活后面。
+    # 注意不能进队列：进了就要等长任务跑完，等于没做。
+    log("SIDE start", who, "主任务在跑，这条走插话通道", repr((it.get("text") or "")[:40]))
+    threading.Thread(target=side_answer,
+                     args=(who, (it.get("text") or "").strip(), _busy_hint.get(who, "")),
+                     daemon=True).start()
 
 
 def start_workers():

@@ -45,8 +45,13 @@
 ## 特性
 
 - **双向消息** — 未读轮询收消息（~50ms/次），文本回复、文件回传
-- **三档权限** — 主人全权 / 访客零工具 / 群聊只读，靠 `openclaw.json` 的 agent 级 deny 清单隔离
+- **三档权限** — 主人全权 / 访客能聊能出文档但碰不到服务器 / 群聊只读，靠 `openclaw.json` 的 agent 级 deny 清单隔离
+- **说话像真人** — 不自报身份、不说「作为助手」、不表演热情；被问「你是不是机器人」随口带过。靠禁用清单实现，不靠形容词
 - **文件回传** — agent 把成品写进 `out/` 目录，桥在本轮结束自动发到微信并归档
+- **访客也能出文档** — 访客 agent 零文件权限，交付走 `[[FILE: 名字.docx]]…[[/FILE]]` 文本协议，由桥侧受控落盘（`.md/.txt/.csv/.html/.json/.docx`，路径与扩展名白名单，200K 字符上限）；`.docx` 是真 Word，标题/列表/表格都转
+- **短消息先分诊** — ≤16 字的短消息先问一次分诊模型（1~2 秒），寒暄直接回（省掉整个 agent 回合），正经问题才起 agent；分诊失败就降级，不构成单点
+- **处理中可以插话** — 长任务跑着时用户又发消息，走独立线程 + 独立 session 立刻回一句，不排在长任务后面；同一会话只允许一条插话在跑
+- **等超过 8 秒先给个回音** — 不会让人对着空窗口猜你在不在
 - **能看图片** — 拿不到加密的 `.dat` 原图，就按气泡坐标截屏再交给 `view_image`
 - **文件是真收到** — 微信收到的附件本来就已经落盘在 `xwechat_files\<wxid>\msg\file\<月份>\`，
   直接按文件名找回来、转进 agent 的 inbox，PDF 用 `pdftotext` 抽正文，docx/pptx/xlsx 用标准库解 xml
@@ -139,7 +144,15 @@ schtasks /create /tn wxapi /tr "C:\setup\start-api.cmd" /sc onlogon /rl highest 
 照 `openclaw.sample.json` 改 `~/.openclaw/openclaw.json`：三个 agent（`owner` 全权、`chat` 零工具、`group` 只读），
 再把 `prompts/*` 拷进各自 workspace 当 `IDENTITY.md` / `USER.md`。
 
-**关键：`chat` 的 deny 里必须留 `read`。** 否则访客可以诱导 agent 读你服务器上的任意文件。
+**关键：`chat` 除了 `read`，还必须 deny `write` / `edit` / `apply_patch`。**
+
+只 deny `read` 是不够的 —— 访客能改 `openclaw.json` 给自己开 `exec`，
+也能覆盖 `~/.ssh/authorized_keys`。写比读危险，要按这个方向全量 deny
+（`ls` / `glob` / `grep` 也算读）。样例里 `chat` 的 deny 一共 56 项。
+
+访客要交文件时**不靠文件权限，靠文本协议**：agent 输出
+`[[FILE: 名字.docx]] … [[/FILE]]`，桥剥掉文件块、按白名单落盘、再把文件发到微信。
+路径、扩展名、大小全卡在桥这边，比给 agent 文件权限容易审计得多。
 
 ```bash
 openclaw config validate     # 多 agent 必须显式声明 main / systemAgent
@@ -176,12 +189,18 @@ SENT <昵称> '你好，有什么可以帮你的'
 | `bindings` + `agents.*.tools.deny` | 进来**能做什么** | `openclaw.json` |
 
 ```
-peer = 主人          →  agent owner  →  全工具
-peer = 任何人（兜底）→  agent chat   →  profile=full + 49 项 deny（read/exec/terminal 全禁）
+peer = 主人          →  agent owner  →  全工具（含 exec、改配置、动服务）
+peer = 任何人（兜底）→  agent chat   →  profile=full + 56 项 deny（read/write/edit/exec/terminal 全禁）
 群聊 @              →  agent group  →  只读，连写文件都禁
 ```
 
-`chat` 允许 `write / edit / view_image / web_search / web_fetch`，所以它既能联网查资料、又能把结果写成文件发回来 —— 但不能读你的磁盘、不能执行命令。
+`chat` 能联网查资料、能算、能写文档，但**碰不到文件系统和命令行**：
+读不了你的磁盘，也改不了配置。它「出文件」的方式是文本协议 + 桥代写，
+所以给不给它 `.docx` 跟给不给它服务器是两件事 —— 前者只受桥的白名单约束。
+
+`owner` 拿到的是完整权限：能跑命令、改系统配置、动 docker / nginx / 面板。
+唯一要求是它在动手前问一句「这会不会让服务下线」类的操作（删大目录、改 sshd、
+动数据库、重启正在跑的服务），其余不用请示。
 
 ## 已知限制（诚实版）
 
@@ -203,13 +222,20 @@ peer = 任何人（兜底）→  agent chat   →  profile=full + 49 项 deny（
   一个人连发就能把全部 worker 占满，主人跟着一起卡。宁可丢陌生人的消息，也不能让主人等
 - **发送是「最多一次」语义**。超时一律不重试（请求可能已经发出去了），
   所以极端情况下存在发不出去且不知道的情况，只能靠日志里的 `send timeout` 追
-- **响应时间有地板**。纯聊天约 4~5 秒（其中 **1.4 秒是每条消息重新启动一个 node 进程**，
+- **响应时间有地板**。纯聊天约 3~5 秒（其中 **1.4 秒是每条消息重新启动一个 node 进程**，
   见 `docs/architecture.md` 的分解）；带工具的回合读文件、转格式可能要 1 分钟以上。
-  超过 8 秒没结果时桥会先回一句「收到，在处理」，所以用户不会对着空聊天窗口猜
+  超过 8 秒没结果时桥会先回一句「收到，在处理」，所以用户不会对着空聊天窗口猜。
+  另外关掉推理（`--thinking off`）只给聊天的两个 agent：主人的那台要调工具，留着思考
+- **分诊不是免费的**。分诊本身要 1~2 秒，所以只对 ≤16 字的短消息用；
+  而且它对「正经问题」净收益为零，只是多一次往返。想省这点钱就 `WX_ROUTER=0` 关掉，
+  关掉只影响寒暄的快慢，不影响正确性
+- **`.docx` 需要 venv**。系统 Python 被 PEP 668 锁住装不了 `python-docx`，
+  unit 里的 `ExecStart` 必须指向装了它的解释器；指错了不会报错，
+  只会把 `.docx` 静默降级成 `.md`
 
 ## 踩坑清单
 
-`docs/pitfalls.md` 里记了 60 条，随手摘几条最坑的：
+`docs/pitfalls.md` 里记了 70 条，随手摘几条最坑的：
 
 - `ChatContent.MessageBubbleList` 是 **internal 属性**，编译期不可见，必须反射
 - `LocateConversation()` **是个假方法**，调完不切会话，读出来的还是上一个会话的气泡
@@ -217,6 +243,10 @@ peer = 任何人（兜底）→  agent chat   →  profile=full + 49 项 deny（
 - 模型声称"看不到图"，八成是配置里 `input: ["text"]`，不是模型不行
 - wxapi 重启后 seq 归零，桥的游标停在旧值 → 永远拉不到新消息，**而且日志一条错都不报**
 - 靠"未读"判断新消息很脆：任何东西读过那个会话，未读就归零，消息永远丢失。必须用持久化的 `UniqueString` 水位
+- **reasoning 模型的 `max_tokens` 给小了表现为"这个问题它答不了"**：预算全烧在 `reasoning_content` 上，
+  `content` 是空的、`finish_reason=length`。看到空内容先打 `finish_reason`
+- **只 deny `read` 等于没设防**：`write` 能改配置给自己开 `exec`，写比读危险
+- **`os.path.basename` 不能用来清洗不可信文件名**：Windows 把 `c:xxx` 当盘符拆，Linux 不拆
 
 ## 免责声明
 
