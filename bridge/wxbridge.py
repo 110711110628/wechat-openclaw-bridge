@@ -8,6 +8,7 @@
 """
 import base64
 import queue
+import re
 import json
 import os
 import subprocess
@@ -120,18 +121,30 @@ GROUP_AGENT = os.environ.get("WX_GROUP_AGENT", "group")
 NL = chr(10)
 
 
-def is_group(who):
+def is_group(who, sender=""):
+    """判定是不是群聊。
+
+    优先用最可靠的信号：**发言人 != 会话名 → 一定是群**（单聊里 Who 永远等于会话名）。
+    探针（/api/group/members）只作为兜底，而且**失败绝不缓存** ——
+    否则一次超时就会把群永久记成私聊，从此群里每句话它都接，变成刷屏。
+    """
     if who in GROUP_CACHE:
         return GROUP_CACHE[who]
-    g = False
+    snd = (sender or "").strip()
+    if snd and snd != who:
+        GROUP_CACHE[who] = True
+        log("probe", who, "-> group (by sender=%s)" % snd)
+        return True
     try:
-        r = api("/api/group/members?name=" + urllib.parse.quote(who), timeout=90)
+        with UI_LOCK:                      # 读群成员要动微信窗口，不能和截屏抢
+            r = api("/api/group/members?name=" + urllib.parse.quote(who), timeout=30)
         g = bool(r.get("ok") and (r.get("members") or []))
+        GROUP_CACHE[who] = g               # 只有探针真的成功了才缓存
+        log("probe", who, "-> group" if g else "-> direct")
+        return g
     except Exception as e:
-        log("group probe error", repr(e))
-    GROUP_CACHE[who] = g
-    log("probe", who, "-> group" if g else "-> direct")
-    return g
+        log("group probe error（本次不缓存）", who, repr(e)[:120])
+        return False
 
 
 def is_mentioned(text):
@@ -192,7 +205,13 @@ def decorate(text):
     return t
 
 
-def collect_outbox(d, since):
+def collect_outbox(d, since, token=""):
+    """把本轮新产出的文件「领走」。
+
+    同一个 agent 的多个会话共用一个 out 目录，光看 mtime 会两边都抢同一批文件 →
+    同一份文件被发两遍，甚至发给错的人。所以用 os.rename 原子领取：
+    改名成功的才算自己的，被别人先改走的直接跳过。
+    """
     out = []
     if not d or not os.path.isdir(d):
         return out
@@ -200,15 +219,23 @@ def collect_outbox(d, since):
         names = os.listdir(d)
     except OSError:
         return out
+    box = os.path.join(d, ".claimed", token or "x")
     for name in names:
         p = os.path.join(d, name)
         if not os.path.isfile(p):
             continue
         try:
-            if os.path.getmtime(p) >= since - 1:
-                out.append(p)
+            if os.path.getmtime(p) < since - 1:
+                continue
         except OSError:
-            pass
+            continue
+        try:
+            os.makedirs(box, exist_ok=True)
+            dst = os.path.join(box, name)
+            os.replace(p, dst)             # 原子：抢到的才算数
+            out.append(dst)
+        except OSError:
+            continue                        # 已经被别的会话领走
     return sorted(out)
 
 
@@ -238,14 +265,24 @@ def send_files(who, paths):
         return False
 
 
-def archive(paths):
+def archive(paths, base=""):
+    """发完的文件挪进 <out>/sent/，别堆在 out 里等下一轮被重新收集。"""
+    boxes = set()
     for p in paths:
         try:
-            d = os.path.join(os.path.dirname(p), "sent")
+            root = base or os.path.dirname(p)
+            d = os.path.join(root, "sent")
             os.makedirs(d, exist_ok=True)
             os.replace(p, os.path.join(d, os.path.basename(p)))
+            boxes.add(os.path.dirname(p))
         except Exception as e:
             log("archive error", repr(e))
+    for b in boxes:                        # 清掉 .claimed/<token> 空壳
+        try:
+            if os.path.basename(os.path.dirname(b)) == ".claimed":
+                os.rmdir(b)
+        except OSError:
+            pass
 
 
 def group_context(who, limit=25):
@@ -254,15 +291,21 @@ def group_context(who, limit=25):
     UIA 的 /api/history/deep 试过两条路都不行 —— 一是对带「、」的群名会
     打开错误的会话（读到别的聊天的内容），二是滚动截屏卡住会把整个 wxapi 拖死。"""
     plain = _plain_context(who, limit)
+    if not plain:
+        # 刚过 0 点的时候「今天」是空的，翻一下昨天的，别让它说「没记录」
+        plain = _plain_context(who, limit, day="yesterday")
     log("group ctx", who, len(plain))
     return NL.join(plain[-limit:])
 
 
-def _plain_context(who, limit):
+def _plain_context(who, limit, day=""):
     """SDK 的 history：快、带发言人（Who 字段），群聊就靠这个分清谁在说话。"""
     lines = []
+    q = "/api/history?who=" + urllib.parse.quote(who)
+    if day == "yesterday":
+        q += "&date=" + time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
     try:
-        d = api("/api/history?who=" + urllib.parse.quote(who), timeout=90)
+        d = api(q, timeout=90)
         for m in (d.get("items") or [])[-limit:]:
             txt = (m.get("Message") or "").strip()
             if not txt:
@@ -342,6 +385,11 @@ def visual_text(who, raw, agent=None):
     任何一步失败都退回 decorate 的诚实兜底。"""
     if not is_image_msg(raw):
         return decorate(raw)
+    if agent == GROUP_AGENT:
+        # 群聊 agent 故意 deny 了 view_image（防止把别人的图当指令去执行），
+        # 那截图也没人能看 —— 别让它去调一个必然失败的工具，如实说看不到就行
+        log("group image: skip screenshot", who)
+        return decorate(raw)
     with UI_LOCK:
         idx = find_last_image_index(who)
         if idx is None:
@@ -371,8 +419,10 @@ def send_text(who, text, tries=3):
 MD_STRIP = [
     ("**", ""), ("__", ""), ("```", ""), ("`", ""),
     ("### ", ""), ("## ", ""), ("# ", ""),
-    ("- ", ""), ("* ", ""),
 ]
+
+# 列表符只删**行首**的：整行替换会把 "10 - 3 = 7" 变成 "10 3 = 7"
+RE_LIST = re.compile(r"^\s*[-*+•]\s+")
 
 
 def clean_reply(t):
@@ -381,7 +431,7 @@ def clean_reply(t):
     for a, b in MD_STRIP:
         t = t.replace(a, b)
     out, blank = [], 0
-    for ln in [x.rstrip() for x in t.split("\n")]:
+    for ln in [RE_LIST.sub("", x.rstrip()) for x in t.split("\n")]:
         if ln == "":
             blank += 1
             if blank > 1:
@@ -408,7 +458,10 @@ def split_long(t, size=500):
             buf += seg
     if buf:
         parts.append(buf)
-    return parts[:4]
+    if len(parts) > 4:
+        parts = parts[:4]
+        parts[-1] = parts[-1] + "\n…（太长了，先说到这，要细节我再展开）"
+    return parts
 
 
 def send_long(who, text):
@@ -433,8 +486,8 @@ def handle(it):
     if who in IGNORE_CONV:
         return
 
-    if is_group(who):
-        sender = (it.get("sender") or "").strip()
+    sender = (it.get("sender") or "").strip()
+    if is_group(who, sender):
         if sender and sender == BOT_NAME:
             log("SKIP", who, "self-echo", repr(raw[:50]))
             return
@@ -484,11 +537,11 @@ def handle(it):
 
     # 回传本轮 agent 生成的文件
     if outdir:
-        files = collect_outbox(outdir, t0)
+        files = collect_outbox(outdir, t0, "s%d" % seq)
         if files:
             log("OUTBOX", who, [os.path.basename(x) for x in files])
             if send_files(who, files):
-                archive(files)
+                archive(files, outdir)
 
 
 def _worker(idx):

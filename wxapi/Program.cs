@@ -83,12 +83,31 @@ object? ReadMember(object o, string name)
 var _inbound = new ConcurrentQueue<Inbound>();
 long _seq = 0;
 var _seen = new HashSet<string>();
+object _sentLock = new();
 object _seenLock = new();
 var _monCts = new CancellationTokenSource();
 var _monWho = new List<string>();
 var _seenMax = 20000;
 int _busy = 0;
 var _sent = new HashSet<string>();
+var _sentQ = new Queue<string>();      // 只用来做 FIFO 淘汰，防止 _sent 无限增长
+const int SENT_MAX = 2000;
+
+// 记下「这条是我发的」，用来过滤自己的回显。超上限就丢掉最老的，不影响近期判重。
+void MarkSent(string t)
+{
+    t = (t ?? "").Trim();
+    if (t.Length == 0) return;
+    lock (_sentLock)
+    {
+        if (_sent.Add(t)) _sentQ.Enqueue(t);
+        while (_sentQ.Count > SENT_MAX)
+        {
+            var old = _sentQ.Dequeue();
+            _sent.Remove(old);
+        }
+    }
+}
 
 // ---- 去重表落盘：重启后不再重复入队，配合启动补扫把停机期间的消息找回来 ----
 var SEEN_FILE = @"C:\setup\wxapi\seen.json";
@@ -136,8 +155,16 @@ async Task<bool> SubmitMonitor(string who)
                 Console.WriteLine("[catchup] start baseline=" + baseline + " convs=" + (vis0?.Count ?? 0));
                 if (vis0 != null)
                 {
+                    // 每个会话都要 GetChatHistory（7 秒级），7 个会话就是 50 秒，
+                    // 这段时间 HTTP 端点基本都在超时 → 给个预算，剩下的交给轮询
+                    var cw = System.Diagnostics.Stopwatch.StartNew();
                     foreach (var v in vis0)
                     {
+                        if (cw.Elapsed.TotalSeconds > 25)
+                        {
+                            Console.WriteLine("[catchup] 超出 25 秒预算，放弃剩余会话（未读会由轮询接手）");
+                            break;
+                        }
                         string w = v.ConversationTitle;
                         if (string.IsNullOrWhiteSpace(w)) continue;
                         try
@@ -204,7 +231,11 @@ async Task<bool> SubmitMonitor(string who)
                                 Console.WriteLine("[poll] QUEUED seq=" + _seq + " who=" + w + " text=" + (m.Message ?? ""));
                             }
                             firstSeen.Add(w);
-                            while (_inbound.Count > 500) _inbound.TryDequeue(out _);
+                            while (_inbound.Count > 500)
+                            {
+                                if (_inbound.TryDequeue(out var lost))
+                                    Console.WriteLine("[poll] DROP 队列溢出丢弃 seq=" + lost.seq + " who=" + lost.who);
+                            }
                             SaveSeen();
                         }
                     }
@@ -344,7 +375,7 @@ app.MapPost("/api/send", async (M m) =>
             return J(new { ok = false, error = "who/text 不能为空" });
         var c = C();
         await c.SendMessage(m.who, m.text);
-        lock (_seenLock) { _sent.Add((m.text ?? "").Trim()); }
+        MarkSent(m.text);
         return J(new { ok = true });
     }
     catch (Exception ex) { return ERR(ex); }

@@ -247,3 +247,69 @@ buf.AddRange(cur.Skip(skip));      // buf 里有分隔条，sig 里没有
 
 同时要把 markdown 符号洗掉：微信不渲染 `**`、`###`、``` 代码块，
 不洗的话用户看到的是满屏星号。
+
+注意列表符只删**行首**的（正则 `^\s*[-*+•]\s+`）——整串替换会把 `10 - 3 = 7` 变成 `10 3 = 7`。
+
+## 判定 / 并发
+
+### 34. 探针失败绝不能缓存，否则群会变成有问必答
+
+判定「这是群还是单聊」靠 `/api/group/members` 探针。最初的写法是无条件
+`GROUP_CACHE[who] = g`，于是探针超时一次就把这个群**永久记成私聊**。
+
+后果不是掉一条消息，而是：私聊分支不要求 @ → 群里从此**每句话它都接**，直接刷屏。
+
+现在两道保险：
+
+1. 先用最可靠的信号：**发言人 != 会话名 → 一定是群**（单聊里 `Who` 永远等于会话名），
+   这一条命中率极高，根本不用打探针
+2. 探针只在兜底时用，**只有成功结果才写缓存**，失败就下次再问
+
+```python
+if snd and snd != who:
+    GROUP_CACHE[who] = True          # 直接定案
+    return True
+try:
+    ...探针...
+    GROUP_CACHE[who] = g             # 只有成功才缓存
+except Exception:
+    return False                     # 失败：本次当私聊，但不留痕
+```
+
+### 35. 多个会话共用一个 `out/` 目录，回传文件会被抢
+
+同一个 agent 的所有会话共享 `workspace-chat/out`。用「mtime > 本轮开始时间」收集产物，
+两个会话几乎同时结束时会**各自收走同一批文件** —— 同一份文件发两遍，甚至发给错的人。
+
+解法：`os.rename` 原子领取，改名成功的才算自己的：
+
+```python
+box = os.path.join(d, ".claimed", token)      # token = 本轮 seq
+os.makedirs(box, exist_ok=True)
+os.replace(p, os.path.join(box, name))        # 抢到才有；OSError 说明被别人领走
+```
+
+归档时把文件挪进 `<out>/sent/`，顺手 `rmdir` 掉空的 `.claimed/<token>`。
+
+### 36. 别在提示里让 agent 用一个它被 deny 的工具
+
+群聊 agent 故意 deny 了 `view_image`（防止别人的图被当指令执行），
+但桥的图片分支仍然写「先用 view_image 看一下这个文件」—— 模型只能干瞪眼，
+然后编一个「看到了」出来。
+
+按 agent 分流：群聊里直接回「你只收到占位文字，看不到画面内容」，
+连截屏都省了（还少占一次 UI 锁）。
+
+### 37. 启动补扫要设时间预算
+
+`GetChatHistory()` 每个会话 7 秒级，7 个会话 = 50 秒。这段时间里 HTTP 端点基本全超时，
+桥那边看就是「服务挂了」。加个 25 秒预算，超了就放弃剩余会话（未读的会由轮询接手）：
+
+```csharp
+var cw = Stopwatch.StartNew();
+foreach (var v in vis0) {
+    if (cw.Elapsed.TotalSeconds > 25) { Console.WriteLine("[catchup] 超预算，交给轮询"); break; }
+    ...
+}
+```
+
