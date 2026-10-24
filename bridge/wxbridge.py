@@ -46,7 +46,6 @@ INBOX_DIRS = {
 }
 
 cursor = 0
-last_accept = 0.0
 deep_block_until = 0.0          # deep 失败后的冷却截止时间
 FAIL_LIMIT = int(os.environ.get("WX_FAIL_LIMIT", "6"))   # 冷启动要 30~60s，4 次太容易误判
 RECOVER_SH = "/opt/wxbridge/recover-wxapi.sh"
@@ -958,10 +957,28 @@ def recover_vm():
         log("WATCHDOG error", repr(e))
 
 
+def accepter():
+    """好友自动通过放独立线程。
+
+    以前它跑在主循环里：一旦这个 UI 调用卡住（超时给到 200 秒），收消息
+    就整体停摆 —— 而且因为它不抛异常，fails 不涨、看门狗不触发，
+    用户看到的就是「三分多钟不理人」。收消息和做杂事必须是两条线。
+    """
+    while True:
+        time.sleep(ACCEPT_INTERVAL)
+        try:
+            r = api("/api/friend/accept", {}, timeout=200)
+            if r.get("passedCount"):
+                log("AUTO-ACCEPT", r.get("passed"))
+        except Exception as e:
+            log("accept error", repr(e))
+
+
 def main():
-    global cursor, last_accept
+    global cursor
     log("wxbridge started: vm=%s owner=%s priv=%s chat=%s" % (VM, OWNER, PRIV_AGENT, CHAT_AGENT))
     start_workers()
+    threading.Thread(target=accepter, daemon=True).start()
     fails = 0
     last_reset = 0.0
     epoch = None            # wxapi 进程代号：只有它变了才是真的重启
@@ -996,15 +1013,6 @@ def main():
                     dispatch(it)
                 except Exception as e:
                     log("dispatch error", repr(e))
-            now = time.time()
-            if now - last_accept >= ACCEPT_INTERVAL:
-                last_accept = now
-                try:
-                    r = api("/api/friend/accept", {}, timeout=200)
-                    if r.get("passedCount"):
-                        log("AUTO-ACCEPT", r.get("passed"))
-                except Exception as e:
-                    log("accept error", repr(e))
         except Exception as e:
             fails += 1
             log("loop error", repr(e), "fails=%d" % fails)
