@@ -26,9 +26,20 @@ OWNER = os.environ.get("WX_OWNER", "主人")
 PRIV_AGENT = os.environ.get("WX_PRIV_AGENT", "owner")
 CHAT_AGENT = os.environ.get("WX_CHAT_AGENT", "chat")
 ACCEPT_INTERVAL = int(os.environ.get("WX_ACCEPT_INTERVAL", "30"))
-POLL_INTERVAL = 0.5
+POLL_INTERVAL = 0.2     # 拉新消息的间隔。0.5 秒时平均白等 0.25 秒，纯属浪费
+ACK_DELAY = float(os.environ.get("WX_ACK_DELAY", "8"))   # 超过这么久没结果就先回一句
 MAX_REPLY = 1200
 OC = "/home/wechat/.npm-global/bin/openclaw"
+
+# agent -> 思考档位。空/缺省 = 不动，用 agent 自己的配置。
+# 闲聊和群问答不需要深度思考；主人那台要调工具，留着。
+# ⚠️ 档位不是随便填的：这个模型只认 off，填 low 会直接报
+#    `Thinking level "low" is not supported`，ask() 返回 None，用户只看到「卡了一下」。
+#    要改之前先用 CLI 手测一次。
+THINKING = {
+    os.environ.get("WX_GROUP_AGENT", "group"): "off",
+    CHAT_AGENT: "off",
+}
 
 # 各 agent 的「成品出口」目录：agent 把要发给用户的文件写到这里，本轮结束自动回传微信
 OUT_DIRS = {
@@ -156,6 +167,13 @@ def find_terminal(o):
 def ask(agent, session, text):
     cmd = [OC, "agent", "--agent", agent, "--session-key", session,
            "-m", text, "--json", "--timeout", "180"]
+    # 思考档位直接影响等待时间（实测同一句话：默认 2.5s，off 1.9s，
+    # 而且尾部从 3.4s 收到 1.9s —— 用户感受到的是尾部，不是中位数）。
+    # 只有「闲聊」和「群里有问就答」敢关；主人那台是全权 agent，要调工具、要看文件，
+    # 思考留着，慢一点换正确率，慢的那部分靠「处理中」提示兜住。
+    th = THINKING.get(agent)
+    if th:
+        cmd += ["--thinking", th]
     try:
         p = __import__("subprocess").run(cmd, capture_output=True, text=True,
                                          timeout=300, cwd="/home/wechat")
@@ -798,6 +816,7 @@ def handle(it):
         log("SKIP", who, "self-echo(pre-probe)", repr(raw[:50]))
         return
     if is_group(who, sender, recent):
+        in_group = True
         if not is_mentioned(raw):
             log("SKIP", who, "group-not-mention", repr(raw[:50]))
             return
@@ -818,6 +837,7 @@ def handle(it):
                     "用简体中文、简短口语化）") % (who, speaker, ctx, speaker, text, speaker)
         log("RECV", who, "GROUP<" + speaker + ">->", agent, repr(raw[:100]))
     else:
+        in_group = False
         agent = PRIV_AGENT if who == OWNER else CHAT_AGENT
         session = "agent:%s:wx-%s" % (agent, who)
         text = handle_input(who, raw, agent)
@@ -836,13 +856,48 @@ def handle(it):
 
     outdir = OUT_DIRS.get(agent)
     t0 = time.time()
-    reply = ask(agent, session, prompt)
-    if not reply:
-        # 一次性失败很常见（模型超时、网关抖一下）。重试一次，同一个 session-key
-        # 上下文还在，比让用户干等着强。
-        log("no reply, retry once", who)
-        time.sleep(2)
+
+    # 「处理中」提示：agent 一个回合要 5 秒，带工具时能干到 90 秒。
+    # 这段时间聊天窗口里一点动静都没有，用户会以为消息没发出去 / 被无视了。
+    # 超过 ACK_DELAY 还没出结果就先说一句，出了结果再发真正的回复。
+    # 群里不发（那里有别人，插一句「稍等」很吵）。
+    ack = {"done": False}
+    ack_lock = threading.Lock()
+
+    def _ack():
+        with ack_lock:
+            if ack["done"]:
+                return
+            ack["done"] = True
+        log("ACK", who, "%.0fs 还没出结果，先回一句" % ACK_DELAY)
+        send_text(who, "收到，我这边在处理，稍等一下。")
+
+    timer = None
+    if not in_group:
+        timer = threading.Timer(ACK_DELAY, _ack)
+        timer.daemon = True
+        timer.start()
+
+    try:
         reply = ask(agent, session, prompt)
+        if not reply:
+            # 重试要看「怎么失败的」：快速失败（网关抖一下、模型空手）重试很有用；
+            # 如果是跑满 180 秒超时才失败，再重试就是让用户再等三分钟 ——
+            # 这种时候不如直接告诉他没成，让他自己决定要不要再发一遍。
+            took = time.time() - t0
+            if took < 25:
+                log("no reply after %.0fs, retry once" % took, who)
+                time.sleep(2)
+                reply = ask(agent, session, prompt)
+            else:
+                log("no reply after %.0fs, too slow to retry" % took, who)
+    finally:
+        with ack_lock:
+            ack["done"] = True
+        if timer:
+            timer.cancel()
+
+    log("ELAPSED", who, "%.1fs" % (time.time() - t0))
     if reply:
         reply = clean_reply(reply)[:MAX_REPLY]
         if reply:
