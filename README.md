@@ -4,6 +4,14 @@
 
 收消息 → 交给 [OpenClaw](https://www.npmjs.com/package/openclaw) 的 agent 处理 → 回复发回微信。附带三个 agent 的权限分级、文件回传、截屏看图、长上下文翻页，以及一套踩了两个月才总结出来的坑。
 
+> ⚠️ **先说清楚前置条件，免得你 clone 下来编译不过**
+>
+> 1. **需要一台常开的 Windows**（虚拟机即可），且已登录真实微信 4.x，窗口不能最小化
+> 2. **需要 `WeChatAuto4x.SDK`**（NuGet 上的第三方商业组件，**不在本仓库内**，需自行获取授权）
+> 3. 需要一台 Linux 跑 OpenClaw（Node 24.16+）
+>
+> 本仓库提供的是**桥接层与全部踩坑经验**，不是开箱即用的全家桶。看完 `docs/pitfalls.md` 再动手，能省你两周。
+
 ```
 微信好友/群 → wxapi(Windows VM) → wxbridge(Linux) → OpenClaw agent → 原路发回
 ```
