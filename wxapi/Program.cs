@@ -28,6 +28,13 @@ const uint KEYEVENTF_KEYUP = 0x0002;
 static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 SystemParametersInfo(SPI_SETSCREENREADER, 1, IntPtr.Zero, 0x01 | 0x02);
 
+// 微信的 UI 自动化全是**同步阻塞**调用（一次 GetChatHistory 就要 7 秒），
+// 只要它占着一个线程池线程，Kestrel 就没线程接新请求 —— 表现是
+// /api/inbound 明明只是读内存队列，却会 30 秒超时，然后守着它的客户端
+// 以为服务挂了。把最小线程数抬上去，几个线程被 UIA 卡住也不影响接请求。
+ThreadPool.GetMinThreads(out int _wMin, out int _iMin);
+ThreadPool.SetMinThreads(Math.Max(_wMin, 64), Math.Max(_iMin, 64));
+
 var builder = WebApplication.CreateSlimBuilder(args);
 builder.Logging.ClearProviders();
 builder.WebHost.UseUrls("http://0.0.0.0:18800");

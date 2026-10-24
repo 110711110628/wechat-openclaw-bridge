@@ -47,8 +47,74 @@ INBOX_DIRS = {
 cursor = 0
 last_accept = 0.0
 deep_block_until = 0.0          # deep 失败后的冷却截止时间
-FAIL_LIMIT = int(os.environ.get("WX_FAIL_LIMIT", "4"))
+FAIL_LIMIT = int(os.environ.get("WX_FAIL_LIMIT", "6"))   # 冷启动要 30~60s，4 次太容易误判
 RECOVER_SH = "/opt/wxbridge/recover-wxapi.sh"
+
+# ── 跨重启去重表 ───────────────────────────────────────────────
+# wxapi 重启后 _seen 归零，会把「未读」重新解析一遍再入队；桥这边如果只靠
+# 内存游标，就会把已经回过的消息再回一遍（实测 22:29:50 就重回过一次）。
+# 把消息唯一串落盘，重启后仍然认得。
+STATE_DIR = os.environ.get("WX_STATE", "/opt/wxbridge/state")
+SEEN_FILE = os.path.join(STATE_DIR, "seen.txt")
+SEEN_MAX = 800
+_seen_lock = threading.Lock()
+
+
+def _load_seen():
+    try:
+        with open(SEEN_FILE, encoding="utf-8") as f:
+            return [x.strip() for x in f if x.strip()]
+    except OSError:
+        return []
+
+
+SEEN = _load_seen()
+SEEN_SET = set(SEEN)
+
+
+def seen_before(u):
+    return bool(u) and u in SEEN_SET
+
+
+def _save_seen_locked():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = SEEN_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(SEEN))
+        os.replace(tmp, SEEN_FILE)      # 原子替换，写一半崩了也不会坏文件
+    except OSError as e:
+        log("seen save error", repr(e)[:100])
+
+
+def mark_seen(u):
+    if not u:
+        return
+    with _seen_lock:
+        if u in SEEN_SET:
+            return
+        SEEN_SET.add(u)
+        SEEN.append(u)
+        while len(SEEN) > SEEN_MAX:
+            old = SEEN.pop(0)
+            SEEN_SET.discard(old)
+        _save_seen_locked()
+
+
+def unmark_seen(u):
+    """处理失败要能重试 —— 占位时写的记录得撤回来。"""
+    if not u:
+        return
+    with _seen_lock:
+        if u not in SEEN_SET:
+            return
+        SEEN_SET.discard(u)
+        try:
+            SEEN.remove(u)
+        except ValueError:
+            pass
+        _save_seen_locked()
+
 
 # 并发：不同会话并行处理，同一会话保序（按 who 哈希固定到一个 worker）
 WORKERS = int(os.environ.get("WX_WORKERS", "3"))
@@ -132,12 +198,17 @@ def is_group(who, sender="", recent=None):
     if who in GROUP_CACHE:
         return GROUP_CACHE[who]
     snd = (sender or "").strip()
+    # ⚠️ 自己发出去的话，sender 就是 bot 自己的名字。这个信号没有判别力 ——
+    # 拿它当证据的话，agent 只要在私聊里回过一次话，这个私聊就会被**永久**
+    # 记成群聊（要求 @ 才回），从此用户不 @ 就再也收不到回复。
+    if snd == BOT_NAME:
+        snd = ""
     if snd and snd != who:
         GROUP_CACHE[who] = True
         log("probe", who, "-> group (by sender=%s)" % snd)
         return True
-    # 只有会话名本人在说话 = 单聊。这条能免掉一次 7~13 秒的全屏探针
-    names = {(m.get("who") or "").strip() for m in (recent or [])} - {""}
+    # 只看真人：把 bot 自己从发言人集合里剔掉，否则 recent 里永远两个人
+    names = {(m.get("who") or "").strip() for m in (recent or [])} - {"", BOT_NAME}
     if len(names) == 1 and who in names:
         GROUP_CACHE[who] = False
         log("probe", who, "-> direct (by recent)")
@@ -650,10 +721,13 @@ def handle(it):
 
     sender = (it.get("sender") or "").strip()
     recent = it.get("recent") or []
+    # 自己发出去的话会被当成新消息读回来。必须在**判群之前**掐掉：
+    # 否则 probe 会拿 sender=OpenClaw 当「发言人≠会话名」的证据，把私聊判成群，
+    # 而且这个错判会被缓存下来，后面所有私聊消息都要 @ 才回。
+    if sender and sender == BOT_NAME:
+        log("SKIP", who, "self-echo(pre-probe)", repr(raw[:50]))
+        return
     if is_group(who, sender, recent):
-        if sender and sender == BOT_NAME:
-            log("SKIP", who, "self-echo", repr(raw[:50]))
-            return
         if not is_mentioned(raw):
             log("SKIP", who, "group-not-mention", repr(raw[:50]))
             return
@@ -717,6 +791,8 @@ def _worker(idx):
             handle(it)
         except Exception as e:
             log("handle error", repr(e))
+            # 占位是入队时就打的，失败要撤回来，否则这条消息永远丢掉
+            unmark_seen((it.get("uniq") or "").strip())
         finally:
             q.task_done()
 
@@ -724,6 +800,12 @@ def _worker(idx):
 def dispatch(it):
     """同一会话固定落一个 worker，保证顺序；不同会话并行。"""
     who = it.get("who") or ""
+    uniq = (it.get("uniq") or "").strip()
+    if seen_before(uniq):
+        log("SKIP", who, "dup(after-restart)", repr((it.get("text") or "")[:40]))
+        return
+    # 入队就占位：同一批 items 里若有同一条消息的重复，后面那条立刻被挡住
+    mark_seen(uniq)
     idx = abs(hash(who)) % WORKERS
     _queues[idx].put(it)
 
@@ -735,8 +817,18 @@ def start_workers():
     log("workers started: %d" % WORKERS)
 
 
+_last_recover = 0.0
+RECOVER_GAP = 240.0     # 4 分钟内不重复重启：wxapi 冷启动本来就要 30~60 秒
+
+
 def recover_vm():
     """wxapi 卡死时，进 VM 强制重启（详见 C:\\setup\\restart-wxapi.cmd）。"""
+    global _last_recover
+    now = time.time()
+    if now - _last_recover < RECOVER_GAP:
+        log("WATCHDOG: %ds 内刚重启过，这次只等它起来" % int(now - _last_recover))
+        return
+    _last_recover = now
     try:
         log("WATCHDOG: wxapi 无响应，进 VM 重启")
         r = subprocess.run([RECOVER_SH], capture_output=True, timeout=180)
@@ -752,17 +844,25 @@ def main():
     log("wxbridge started: vm=%s owner=%s priv=%s chat=%s" % (VM, OWNER, PRIV_AGENT, CHAT_AGENT))
     start_workers()
     fails = 0
+    last_reset_log = 0.0
     while True:
         try:
-            d = api("/api/inbound?after=%d" % cursor, timeout=30)
+            # 10 秒足够：wxapi 那边最慢的一次 GetChatHistory 也就 7 秒。
+            # 原来给 30 秒，一旦它线程池被打满，桥会白等半分钟，期间消息全堵着。
+            d = api("/api/inbound?after=%d" % cursor, timeout=10)
             fails = 0
-            # wxapi 重启后 seq 会归零，游标必须跟着退回去，否则永远拉不到新消息
+            # wxapi 重启后 seq 会归零，游标必须跟着退回去，否则永远拉不到新消息。
+            # last==0 且队列本来就空时，这里每轮都会成立 —— 只重置游标，日志限流，
+            # 免得刷屏把真正的错误淹掉。重复消费由落盘的去重表兜住。
             try:
                 last = int(d.get("last") or 0)
             except (TypeError, ValueError):
                 last = 0
             if last < cursor:
-                log("seq reset detected: last=%d cursor=%d -> reset to 0" % (last, cursor))
+                now = time.time()
+                if now - last_reset_log > 60:
+                    last_reset_log = now
+                    log("seq reset: last=%d cursor=%d -> 0" % (last, cursor))
                 cursor = 0
             for it in (d.get("items") or []):
                 try:
@@ -786,6 +886,9 @@ def main():
                 fails = 0
                 time.sleep(25)
                 continue
+            # 失败后别每 0.5 秒打一次：1→2→3 秒递增，最多 5 秒
+            time.sleep(min(fails, 5))
+            continue
         time.sleep(POLL_INTERVAL)
 
 
