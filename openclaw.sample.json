@@ -1,0 +1,279 @@
+{
+  "agents": {
+    "defaults": {
+      "authInheritance": {
+        "agentId": "main"
+      },
+      "workspace": "/home/wechat/.openclaw/workspace",
+      "models": {
+        "my-gateway/deepseek-flash": {}
+      },
+      "model": {
+        "primary": "my-gateway/deepseek-flash"
+      },
+      "systemAgent": {
+        "agentId": "owner"
+      }
+    },
+    "entries": {
+      "owner": {
+        "name": "主人",
+        "workspace": "/home/wechat/.openclaw/workspace",
+        "agentDir": "/home/wechat/.openclaw/agents/owner/agent",
+        "identity": {
+          "name": "主人"
+        }
+      },
+      "chat": {
+        "name": "小助手",
+        "description": "微信访客聊天助手：可联网检索、可把成品写成文件回传微信；禁止读取服务器任意文件、禁止执行命令、禁止修改配置",
+        "workspace": "/home/wechat/.openclaw/workspace-chat",
+        "agentDir": "/home/wechat/.openclaw/agents/chat/agent",
+        "tools": {
+          "profile": "full",
+          "deny": [
+            "gateway",
+            "wechat__*",
+            "exec",
+            "process",
+            "code_execution",
+            "read",
+            "browser",
+            "screen",
+            "theme",
+            "dashboard",
+            "terminal",
+            "portal",
+            "canvas",
+            "show_widget",
+            "automations",
+            "cron",
+            "plugins",
+            "openclaw",
+            "sessions",
+            "sessions_list",
+            "sessions_history",
+            "sessions_search",
+            "conversations_list",
+            "conversations_send",
+            "conversations_turn",
+            "sessions_send",
+            "sessions_spawn",
+            "sessions_yield",
+            "subagents",
+            "suggest_task",
+            "dismiss_task",
+            "agents_list",
+            "get_goal",
+            "create_goal",
+            "update_goal",
+            "progress_card",
+            "ask_user",
+            "skill_workshop",
+            "nodes",
+            "computer",
+            "message",
+            "image_generate",
+            "music_generate",
+            "video_generate",
+            "tts",
+            "pdf",
+            "memory_search",
+            "memory_get",
+            "x_search"
+          ]
+        }
+      },
+      "group": {
+        "name": "群助手",
+        "description": "群聊专用：只有被 @ 时才响应。只可联网查询与常识问答，禁止读取/修改服务器文件与配置、禁止执行命令",
+        "workspace": "/home/wechat/.openclaw/workspace-group",
+        "agentDir": "/home/wechat/.openclaw/agents/group/agent",
+        "tools": {
+          "profile": "full",
+          "deny": [
+            "gateway",
+            "wechat__*",
+            "exec",
+            "process",
+            "code_execution",
+            "read",
+            "write",
+            "edit",
+            "apply_patch",
+            "browser",
+            "screen",
+            "theme",
+            "dashboard",
+            "terminal",
+            "portal",
+            "canvas",
+            "show_widget",
+            "automations",
+            "cron",
+            "plugins",
+            "openclaw",
+            "skills",
+            "skill_workshop",
+            "sessions",
+            "sessions_list",
+            "sessions_history",
+            "sessions_search",
+            "conversations_list",
+            "conversations_send",
+            "conversations_turn",
+            "sessions_send",
+            "sessions_spawn",
+            "sessions_yield",
+            "subagents",
+            "suggest_task",
+            "dismiss_task",
+            "agents_list",
+            "get_goal",
+            "create_goal",
+            "update_goal",
+            "progress_card",
+            "ask_user",
+            "nodes",
+            "computer",
+            "message",
+            "view_image",
+            "image_generate",
+            "music_generate",
+            "video_generate",
+            "tts",
+            "pdf"
+          ]
+        }
+      }
+    },
+    "ownership": "explicit"
+  },
+  "plugins": {
+    "entries": {
+      "anthropic": {
+        "config": {
+          "sessionCatalog": {
+            "enabled": false
+          }
+        }
+      },
+      "codex": {
+        "config": {
+          "sessionCatalog": {
+            "enabled": false
+          }
+        }
+      },
+      "openclaw-weixin": {
+        "enabled": true
+      }
+    }
+  },
+  "meta": {
+    "migrations": {
+      "modelPolicyAllowlist": true,
+      "utilityModelSeparation": true
+    },
+    "lastTouchedVersion": "2026.10.6"
+  },
+  "gateway": {
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "<REDACTED>"
+    },
+    "port": 18789,
+    "bind": "loopback",
+    "tailscale": {
+      "mode": "off"
+    }
+  },
+  "tools": {
+    "profile": "full"
+  },
+  "skills": {
+    "install": {
+      "nodeManager": "npm"
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "my-gateway": {
+        "baseUrl": "https://api.example.com/v1",
+        "api": "openai-completions",
+        "apiKey": "<REDACTED>",
+        "models": [
+          {
+            "id": "deepseek-flash",
+            "name": "deepseek-flash (Custom Provider)",
+            "contextWindow": 128000,
+            "maxTokens": 4096,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "reasoning": false
+          }
+        ]
+      }
+    }
+  },
+  "hooks": {
+    "internal": {
+      "entries": {
+        "session-memory": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "wizard": {
+    "lastRunAt": "2026-10-23T17:43:33.700Z",
+    "lastRunVersion": "2026.10.6",
+    "lastRunCommand": "onboard",
+    "lastRunMode": "local"
+  },
+  "mcp": {
+    "servers": {
+      "wechat": {
+        "command": "/usr/bin/python3",
+        "args": [
+          "/home/wechat/wx-mcp/server.py"
+        ],
+        "env": {
+          "WXAPI": "http://192.168.122.100:18800",
+          "WXTOKEN": "<REDACTED>"
+        }
+      }
+    }
+  },
+  "bindings": [
+    {
+      "agentId": "owner",
+      "comment": "授权 <PEER_ID> -> owner（全权，可调用工具/下发任务）",
+      "match": {
+        "channel": "openclaw-weixin",
+        "accountId": "*",
+        "peer": {
+          "kind": "direct",
+          "id": "<REDACTED_PEER_ID>"
+        }
+      }
+    },
+    {
+      "agentId": "chat",
+      "comment": "兜底：微信渠道所有未显式授权的联系人 -> 纯聊天",
+      "match": {
+        "channel": "openclaw-weixin",
+        "accountId": "*"
+      }
+    }
+  ]
+}

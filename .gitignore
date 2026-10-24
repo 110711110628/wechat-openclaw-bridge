@@ -1,0 +1,35 @@
+# ---- secrets / config ----
+.env
+*.env
+!*.env.example
+openclaw.json
+seen.json
+*.log
+
+# ---- build output ----
+bin/
+obj/
+out/
+sent/
+inbox/
+node_modules/
+__pycache__/
+*.pyc
+*.dll
+*.pdb
+
+# ---- runtime state ----
+*.png
+!assets/*.png
+*.db
+
+# ---- editors / OS ----
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ---- office temp ----
+~$*

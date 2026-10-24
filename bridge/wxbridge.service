@@ -1,0 +1,25 @@
+[Unit]
+Description=WeChat VM <-> OpenClaw bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wechat
+WorkingDirectory=/opt/wxbridge
+Environment=WXAPI_URL=http://192.168.122.100:18800
+Environment=WXAPI_TOKEN=CHANGE_ME_WXAPI_TOKEN
+Environment=WX_OWNER=主人
+Environment=WX_PRIV_AGENT=owner
+Environment=WX_CHAT_AGENT=chat
+Environment=WX_GROUP_AGENT=group
+Environment=WX_BOT_NAME=OpenClaw
+Environment=WX_FAIL_LIMIT=4
+ExecStart=/usr/bin/python3 /opt/wxbridge/wxbridge.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
