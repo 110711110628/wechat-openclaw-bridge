@@ -469,3 +469,40 @@ ThreadPool.SetMinThreads(Math.Max(w, 64), Math.Max(i, 64));
 - 桥的拉取超时 `30s → 10s`（7 秒的 UI 操作都做完了，不值得白等半分钟），失败按 1→5 秒退避
 - 自愈加冷却：4 分钟内不重复重启 wxapi。它冷启动本来就要 30~60 秒，
   把「正在启动」误判成「挂了」会形成重启抖动
+
+### 45. `last` 骗人：队列空和刚重启长得一模一样
+
+`/api/inbound` 原来返回 `last = _seq`（队列里最后一条的序号）。客户端拿它判断游标要不要退回：
+
+```python
+if last < cursor:      # 「服务重启了，seq 归零了」
+    cursor = 0
+```
+
+问题是**队列空的时候 `_seq` 也是 0**，跟"刚重启"完全无法区分。于是：
+
+1. 桥拉到一条消息，`cursor` 推到 3
+2. 队列被消费空，`last` 回到 0 → `0 < 3` 成立 → 游标重置为 0
+3. `after=0` 又把队列里剩下的旧消息全拉一遍 → 去重挡下 → 但**去重挡下的消息不会推进游标**
+4. 回到第 2 步，每 0.5 秒循环一次
+
+症状就是日志被 `SKIP ... dup(after-restart)` 刷满，3 分钟刷了 352 行。
+
+两个修复：
+
+- 服务端多给一个 `epoch`（进程启动时间戳），客户端**只认它**
+- 客户端把游标推进挪到 `dispatch()` 里 —— 包括被去重挡下的消息也要推，
+  否则游标就永远停在原地
+
+```csharp
+string _epoch = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmssfff");
+return J(new { ok = true, count = items.Count, last = _seq, epoch = _epoch, items });
+```
+
+```python
+if ep is not None and epoch is not None and ep != epoch:
+    cursor = 0            # 只有换了进程才归零
+epoch = ep
+for it in items:
+    dispatch(it)          # dispatch 内部推进 cursor，不管这条要不要处理
+```

@@ -33,10 +33,16 @@
 | POST | `/api/monitor/start` | `{who:"*"}` | 启动监听，`*` 表示全部会话 |
 | POST | `/api/monitor/stop` | — | 停止 |
 | GET | `/api/monitor/status` | — | `{listening, seq, queued, seen}` |
-| GET | `/api/inbound` | `after=seq` | 拉取 `seq > after` 的消息：`{seq, who, text, time, uniq, sender}` |
+| GET | `/api/inbound` | `after=seq` | 拉取 `seq > after` 的消息：`{seq, who, text, time, uniq, sender, recent}` |
+| ↳ 响应 | | | `{ok, count, last, epoch, items}` |
 
 `sender` 是发言人昵称（来自 `Message.Who`），群聊里靠它区分「谁 @ 了你」；
 一对一会话里它等于 `who`。
+
+`epoch` 是**本进程的启动时间戳**，客户端必须靠它判断「服务重启了、seq 归零了」。
+不要用 `last < cursor` 判断 —— `last` 是队列里最后一条的序号，队列空时它也是 0，
+跟"刚重启"长得一模一样，客户端会被骗着把游标反复重置回 0，然后把整条队列重拉一遍。
+`recent` 是随消息附带的最近 6 条，省掉客户端再读一次历史（那次要 7 秒）。
 
 监听实现要点：
 
