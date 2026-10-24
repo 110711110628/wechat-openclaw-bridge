@@ -1,0 +1,9 @@
+[Unit]
+Description=wxapi watchdog (restart the VM-side API if it stops answering)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=WXAPI_URL=http://192.168.122.100:18800
+Environment=WXAPI_TOKEN=CHANGE_ME_WXAPI_TOKEN
+ExecStart=/opt/wxbridge/wxbridge-watchdog.sh

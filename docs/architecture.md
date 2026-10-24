@@ -129,7 +129,21 @@ await Task.Delay(700);
 时间分隔条（`mmui::ChatItemView`，内容形如 `21:25`）**会重复出现**。
 如果拿它参与比对，会误判「整屏都是重叠」，把新内容全丢掉（实测 24 条降到 8 条）。
 
-解法：判重时把分隔条换成**带轮次编号的唯一标记**，输出时再用真实类型。
+解法：判重时**彻底排除分隔条**，只比真实消息；重叠条数按真实消息算完，再换算回
+「带分隔条的下标」，输出照旧保留分隔条。
+
+第一版其实写错了 —— 当时把分隔条换成「带轮次编号的唯一标记」，编号每轮都不同，
+跨轮比对永远匹配不上，结果整屏被重复追加一次（现象是上下文里同一段话出现两遍）。
+
+```csharp
+bool IsSep(string cls) => cls.EndsWith("ChatItemView")
+                          && !cls.Contains("ChatTextItemView")
+                          && !cls.Contains("ChatBubble");
+```
+
+顺带说一句：这个接口现在已经**不在主链路上**。对带 `、` 的群名，
+`GetChatHistory(name)` 会打开错误的会话，deep 于是读到别人的聊天记录（见 `docs/pitfalls.md` 31）。
+聊天上下文一律用 `/api/history`（带 `Who`、1~7 秒），deep 只留作人工排查。
 
 ## 自愈
 
@@ -141,6 +155,8 @@ UI 自动化偶发死锁。一旦某个端点卡住，wxapi 内部状态被占�
 1. **调用方短超时 + 冷却**：`/api/history/deep` 客户端 90s，失败后 10 分钟不再用它
 2. **看门狗**：桥连续 4 次拉不到 `inbound` → 调 `recover-wxapi.sh`
 3. **VM 内重启脚本**：`netstat` 找 PID → `taskkill /F` → `schtasks /end` → `schtasks /run`
+4. **宿主 systemd timer**：每 2 分钟探一次 `/api/status`，连探 3 次都不应答才动手。
+   这一层防的是「桥自己也停了」—— 前两层都需要桥活着才能触发。
 
 注意 `tasklist` 里**没有 `wxapi.exe`**，进程名是 `dotnet.exe`，所以只能按端口找 PID。
 

@@ -156,7 +156,7 @@ async Task<bool> SubmitMonitor(string who)
                                 bool echo0;
                                 lock (_seenLock) { echo0 = _sent.Contains(txt0); }
                                 if (echo0) continue;
-                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString));
+                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString, (ReadMember(m, "Who") as string) ?? ""));
                                 Console.WriteLine("[catchup] QUEUED who=" + w + " text=" + txt0);
                             }
                             firstSeen.Add(w);
@@ -200,7 +200,7 @@ async Task<bool> SubmitMonitor(string who)
                                 bool echo;
                                 lock (_seenLock) { echo = txt.Length > 0 && _sent.Contains(txt); }
                                 if (echo) continue;
-                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString));
+                                _inbound.Enqueue(new Inbound(Interlocked.Increment(ref _seq), w, m.Message ?? "", m.SendDateTime ?? "", m.UniqueString, (ReadMember(m, "Who") as string) ?? ""));
                                 Console.WriteLine("[poll] QUEUED seq=" + _seq + " who=" + w + " text=" + (m.Message ?? ""));
                             }
                             firstSeen.Add(w);
@@ -682,20 +682,22 @@ app.MapGet("/api/history/deep", async (string who, int? pages, int? limit) =>
             if (items.Length == 0) break;
 
             var cur = new List<(string, string)>();
-            var cursig = new List<(string, string)>();
+            var cursig = new List<(string, string)>();   // 判重叠用：不含时间分隔条
             for (int i = 0; i < items.Length; i++)
             {
                 var it = items.GetValue(i)!;
                 string scls = (ReadMember(it, "ClassName") as string) ?? "";
                 string snm = (ReadMember(it, "Name") as string) ?? "";
                 cur.Add((scls, snm));
-                // 时间分隔条（mmui::ChatItemView）内容会重复，拿去比重叠必错 → 只在这份里换唯一标记
+                // 时间分隔条（mmui::ChatItemView）的 "19:39" 每屏都会重复出现，
+                // 拿它判重叠必然错位 → 完全排除在签名之外，只在输出里保留
                 bool isSep = scls.EndsWith("ChatItemView")
                              && !scls.Contains("ChatTextItemView")
                              && !scls.Contains("ChatBubble");
-                cursig.Add(isSep ? ("SEP", "#" + round + ":" + i) : (scls, snm));
+                if (!isSep) cursig.Add((scls, snm));
             }
 
+            // 找「上一屏尾部」与「这一屏开头」的最大重叠（只数真实消息）
             int best = 0;
             for (int k = Math.Min(sig.Count, cursig.Count); k > 0; k--)
             {
@@ -707,14 +709,31 @@ app.MapGet("/api/history/deep", async (string who, int? pages, int? limit) =>
                 if (ok) { best = k; break; }
             }
 
+            // 把「重叠 best 条真实消息」换算成 cur 的下标，分隔条不计数但保留
+            int skip = 0;
+            if (best > 0)
+            {
+                int seenReal = 0;
+                for (int i = 0; i < cur.Count; i++)
+                {
+                    string c0 = cur[i].Item1;
+                    bool sep = c0.EndsWith("ChatItemView")
+                               && !c0.Contains("ChatTextItemView")
+                               && !c0.Contains("ChatBubble");
+                    if (!sep) seenReal++;
+                    if (seenReal >= best) { skip = i + 1; break; }
+                }
+                if (skip == 0) skip = cur.Count;
+            }
+
             if (best == 0 && buf.Count > 0)
             {
-                buf.InsertRange(0, cur);          // 无重叠：这批更早，插到前面
+                buf.InsertRange(0, cur);            // 无重叠：这一屏更早，插到前面
                 sig.InsertRange(0, cursig);
             }
             else
             {
-                buf.AddRange(cur.Skip(best));     // 有重叠：只补新增部分
+                buf.AddRange(cur.Skip(skip));       // 有重叠：只补后面新增的
                 sig.AddRange(cursig.Skip(best));
             }
             rounds++;
@@ -834,7 +853,7 @@ record MQ(string who);
 record GC(string name, string firstWho, string[] members);
 record GI(string name, string[] members, string reason);
 record GQ(string name, bool clearHistory);
-record Inbound(long seq, string who, string text, string time, string uniq);
+record Inbound(long seq, string who, string text, string time, string uniq, string sender);
 record U(string name, string data);
 record UF(string name, string data);
 record US(string who, UF[] files);

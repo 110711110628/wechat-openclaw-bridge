@@ -33,7 +33,10 @@
 | POST | `/api/monitor/start` | `{who:"*"}` | 启动监听，`*` 表示全部会话 |
 | POST | `/api/monitor/stop` | — | 停止 |
 | GET | `/api/monitor/status` | — | `{listening, seq, queued, seen}` |
-| GET | `/api/inbound` | `after=seq` | 拉取 `seq > after` 的消息 |
+| GET | `/api/inbound` | `after=seq` | 拉取 `seq > after` 的消息：`{seq, who, text, time, uniq, sender}` |
+
+`sender` 是发言人昵称（来自 `Message.Who`），群聊里靠它区分「谁 @ 了你」；
+一对一会话里它等于 `who`。
 
 监听实现要点：
 
@@ -41,7 +44,7 @@
 - 命中后 `GetChatHistory(who, DateTime.Today)`，取**最后 6 条**（@ 和正文常分两条发）
 - 用 `UniqueString` 去重，去重表落盘 `seen.json`，重启不重复入队
 - 启动时做一次 **catch-up 补扫**：把所有会话各读 6 条，未见过且非基线的入队 —— 补回停机期间漏的消息
-- 自己的回复通过 `_sent` 集合过滤，避免自问自答
+- 自己的回复通过 `_sent` 集合过滤，避免自问自答；群聊再加一道 `sender == 自己的昵称` 判断
 
 ## 气泡与图片
 
@@ -55,6 +58,10 @@
 `/api/shot` 的 `index` 支持负数（`-1` 最后一条，`-2` 倒数第二条），`pad` 是向外扩的像素（默认 4，上限 40）。
 
 `/api/history/deep` 返回 `{ok, rounds, took, count, items:[{type,text}]}`。`pages` 1~12，`limit` 10~200，内部有 55 秒硬上限。
+
+> ⚠️ 这个接口**不要用于聊天上下文**：对带 `、` 的群名，`GetChatHistory(name)` 会打开错误的会话，
+> 于是它读到的是别人的聊天记录。它读的是「当前打开会话」的气泡板，没有发言人字段。
+> 要发言人就用 `/api/history` 的 `Who`。
 
 ## 群
 
