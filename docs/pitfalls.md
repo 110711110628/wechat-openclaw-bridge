@@ -1007,3 +1007,161 @@ ExecStart=/opt/wxbridge/.venv/bin/python /opt/wxbridge/wxbridge.py
   每步点击后再截一张对比，否则你根本不知道点中了什么
 - 挪窗口前先确认它在屏幕内：这台机器上微信主窗口在 `y=-48`，
   顶部那条（正好是账号头像所在）整条在屏幕外，怎么点都点不到
+
+---
+
+## 第五轮：微信自动升级后退登（2026-10-25）
+
+一次「发微信没反应」的完整复盘。整条链路每一层都没报错，但整条链路是死的 ——
+因为微信半夜自动升级，升级完把账号登出了。
+
+### 72. 先看窗口类名，别猜
+
+UIA 顶层元素的 `ClassName` 是唯一可靠的判据：
+
+| ClassName | 含义 |
+| --- | --- |
+| `mmui::MainWindow` | 正常，已登录 |
+| `mmui::LoginWindow` | **已退登，只剩登录页** |
+
+坑在于 Win32 侧两者都是 `Qt51514QWindowIcon`、标题都是 `微信`，
+所以 `visible=True / iconic=False` 看着一切正常，SDK 却一直报
+`WechatNotOpenedException: 检查到系统中未打开微信窗口 或者 微信窗口处于隐藏状态`。
+
+**那句报错的字面意思（窗口隐藏/最小化）会把人带偏**，真实原因是没有主窗口。
+排查第一步永远是：`RootElement.FindAll(Children)` 把那几个顶层元素的
+`ClassName` 打出来看一眼。窗户到底存不存在，比任何日志都直接。
+
+顺带一个取证姿势（无 GUI 也行）：
+
+```bash
+virsh screenshot <vm-name> /tmp/shot.png   # 宿主机上直接抓 VM 真实画面
+```
+
+### 73. `IsForceOpenUITree` 必须开，默认是 false
+
+微信 4.1.9.xx 以后是否公开 UI Tree 由腾讯内部算法决定。SDK 有开关：
+
+```csharp
+WeAutomation.Initialize(o => {
+    o.IsForceOpenUITree = true;   // 社区版 2.1.8 起提供
+    o.EnableOCR = true;
+});
+```
+
+不开的话初始化能过、`GetWeChatClientNames()` 能返回客户端名，
+但一旦真去读控件就抛
+`WechatNotSupportUITreeException: 腾讯没有公开 processID=xxx 的微信的 UI Tree`。
+
+开了之后日志里会出现：
+
+```
+UI Tree Activator started (check_only=False, pid=...)
+Target detail: pid=... source=scanner rva=0x........
+ACTIVATION_WRITTEN
+[UI Tree 观察] 共采样 21 次，最终值=1
+```
+
+原理是按 RVA 找到 `Weixin.dll` 里的门控字节写 1。**微信一升级 RVA 就变**，
+那个「scanner」是猜着找的，升级后第一次启动偶尔会失败，重启一次通常就好。
+
+### 74. Qt 自绘按钮，`InvokePattern.Invoke()` 返回成功但什么都没发生
+
+登录页的「登录」是 `mmui::XOutlineButton`。走 UIA：
+
+```csharp
+btn.GetCurrentPattern(InvokePattern.Pattern).Invoke();   // 不抛异常
+```
+
+日志一切正常，界面纹丝不动。Qt 的自绘控件没有实现 Invoke provider，
+`Invoke()` 等于空实现。
+
+**正解**：拿 `BoundingRectangle` 算中心点，真点一次。
+
+```csharp
+SetCursorPos(cx, cy);
+mouse_event(0x0002, 0, 0, 0, IntPtr.Zero);   // down
+mouse_event(0x0004, 0, 0, 0, IntPtr.Zero);   // up
+```
+
+`BoundingRectangle` 是物理像素，`SetCursorPos` 也是物理像素，不用管 DPI 缩放。
+但**先确认坐标在屏幕内**：这台机器上微信主窗口在 `y=-48`，
+窗口标题栏那条整条在屏幕外，按坐标点会点到别处。
+
+### 75. `SendMessage` 找不到会话时**静默成功**
+
+```csharp
+await c.SendMessage("__不存在的会话__", "hi");   // 返回 ok，微信里什么都没发
+```
+
+所以「接口回 200 就当发成功了」是错的。至少要拿
+`GetVisibleConversations()` 对一遍目标在不在列表里，不在就记一条警告 ——
+注意这个列表可能分页，只能用来记日志，不能用来拦截，误拦的代价更大。
+
+`文件传输助手` 不在可见会话列表里（它是独立入口），
+所以拿它做发送自测会得到**假通过**。要自测就发给一个真实存在的会话。
+
+### 76. 启动时枚举抖动 → 整轮监听没挂上
+
+wxapi 启动后要 `SubmitMonitor("*")` 才会开始轮询。日志里出现过：
+
+```
+fail: 获取微信窗口失败: An item with the same key has already been added. Key: ...
+[warm] init error: ...
+```
+
+一次失败就等于 `listening: []` —— 端口通、`/api/status` 回 `online:true`、
+`/api/send` 也能发出去，**但没有任何人在听新消息**。
+表现就是「机器人突然不理人，但你让它发消息它照发」。
+
+判据是 `/api/monitor/status` 里的 `listening` 为空。
+启动代码改成最多试 6 次、每次 6 秒，直到每个会话都注册上为止。
+
+### 77. 脚本文件不写 BOM，中文注释能把整个脚本干死
+
+这条在 `.bat` 和 `.ps1` 上各撞了一次，机理一样：
+
+- `.bat` → cmd 按 GBK 解析，含中文的行会被切碎当命令执行（`'批深层目录' is not recognized`）
+- `.ps1` → Windows PowerShell 5.1 对无 BOM 的 UTF-8 **按 ANSI/GBK 解码**，
+  多字节被切碎后偶尔拼出一个引号，整个文件语法错误
+- **进程退出码 1，脚本自己该写的第一行日志都没有**（`Set-Content` 在解析失败的文件里根本没执行）
+
+判据：`上次结果: 1` 且脚本本该产生的日志文件不存在 = 解析期就死了，不是逻辑错。
+解法：`.ps1` 一律 UTF-8 **with BOM**；`.bat` 一律 GBK + `chcp 936` + 全 CRLF；
+或者干脆脚本里只写 ASCII，中文留给输出的文本。
+
+### 78. `schtasks` / `tasklist` 的参数经过两层 ssh 必被拆坏
+
+```
+tasklist /fi "PID eq 6380"     # 到对面变成 /fi PID eq 6380 → 无效参数
+```
+
+本机 → 跳板 → VM 这种两层 ssh，内层引号先被跳板吃掉，再被 cmd 重解析。
+`/fi`、`/tr`、带空格的路径全中招。
+
+可用姿势：命令里**不出现引号和带空格的参数**（`schtasks /run /tn 名字` 是安全的），
+复杂参数一律落成 `.xml` 再 `schtasks /create /xml`。
+`.xml` 必须是 **UTF-16 带 BOM**（`ff fe`），否则报错。
+
+另外 `schtasks /create` 带 `/rp` 会把 `LogonType` 变成
+`InteractiveTokenOrPassword`，没有缓存凭据时会降级到 session 0，**GUI 不可见**。
+要 `InteractiveToken` 就**不要给 `/rp`**，用 `/ru 用户 /it`。
+
+### 79. 「静默死」比「报错死」难查得多
+
+这次的真实代价不是修不好，而是**没人知道它坏了**：
+
+- wxbridge 看到 `WechatNotOpenedException` 只会当成网络抖动，
+  每失败 5 次就重启一次 wxapi，日志里刷成一片 `wxapi 重启，游标归零`
+- 重启当然修不好 —— 微信根本没登录
+- 结果从凌晨 4:44 一直烂到上午 11:20 才被人发现
+
+所以判据要放在**最外层**：`/api/status` 返回 `online:true` 只能说明进程活着，
+要有一个定时任务每 2 分钟看一次窗口类名：
+
+- 出现 `mmui::LoginWindow` → 点一次「登录」（账号是记住的，一次点击就回来）
+- 主窗口 `IsIconic` → `ShowWindow(SW_RESTORE)`，SDK 看不见最小化窗口
+- 都没有 → 微信进程真没了，记一条 WARN，别乱拉进程
+
+这个自愈任务比任何日志告警都值 —— **退出登录是这台机器唯一天天可能发生、
+而人又不会立刻发现的故障**。

@@ -1304,6 +1304,20 @@ def accepter():
             r = api("/api/friend/accept", {}, timeout=200)
             if r.get("passedCount"):
                 log("AUTO-ACCEPT", r.get("passed"))
+                # 以前只往 journal 写一行，主人根本不知道谁加了自己 ——
+                # 自动通过这件事本身要让人看得见，否则等于没人管。
+                names = []
+                for item in (r.get("passed") or []):
+                    if not isinstance(item, dict):
+                        continue
+                    who = item.get("Who") or ""
+                    src = item.get("FromKeyword") or ""
+                    if not who:
+                        continue
+                    names.append(who + ("（" + src + "）" if src else ""))
+                if names:
+                    ok = send_text(OWNER, "已自动通过好友：" + "、".join(names))
+                    log("NOTIFY", OWNER, "ok" if ok else "failed")
         except Exception as e:
             log("accept error", repr(e))
 

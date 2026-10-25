@@ -246,6 +246,12 @@ UI 自动化偶发死锁。一旦某个端点卡住，wxapi 内部状态被占�
 3. **VM 内重启脚本**：`netstat` 找 PID → `taskkill /F` → `schtasks /end` → `schtasks /run`
 4. **宿主 systemd timer**：每 2 分钟探一次 `/api/status`，连探 3 次都不应答才动手。
    这一层防的是「桥自己也停了」—— 前两层都需要桥活着才能触发。
+5. **UI 层自愈**：`tools/wx_heal.ps1` 每 2 分钟看一次 UIA 顶层类名 ——
+   `mmui::LoginWindow` 就真实点击「登录」，`mmui::MainWindow` 被最小化就 `ShowWindow(h, 9)`。
+   这一层救的是前四层都无能为力的状态：微信自动升级后账号退登，进程活着、窗口也在，
+   但 SDK 能看到的只有一个登录窗口（它抛的却是「窗口隐藏/最小化」）。
+
+> 前四层管「服务卡死 / 进程没了」，第五层管「进程好好的，但人不在登录态」。
 
 注意 `tasklist` 里**没有 `wxapi.exe`**，进程名是 `dotnet.exe`，所以只能按端口找 PID。
 

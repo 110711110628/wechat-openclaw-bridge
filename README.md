@@ -64,6 +64,11 @@
 - **长回复分段** — 洗掉 markdown 符号，按句切成 ≤500 字几条发，避免被微信吞
 - **@ 识别** — 处理了微信 @ 后面那个 U+2005 窄空格，以及「@ 和正文分两条发」
 - **双层自愈** — bridge 里连续 N 次拉不到就 SSH 进 VM 强杀重启；宿主再挂一个 2 分钟的 systemd timer，防的是 bridge 也停了
+- **退登能自己点回来** — 微信自动升级后账号掉线，只剩登录窗口，而 SDK 报的是「窗口隐藏/最小化」（文案误导）。
+  `tools/wx_heal.ps1` 每 2 分钟看一次 UIA 顶层类名：`mmui::LoginWindow` 就真去点「登录」（Qt 自绘控件
+  `InvokePattern.Invoke()` 返回成功但毫无反应，必须 `BoundingRectangle` 算中心 + `SetCursorPos` + `mouse_event`），
+  `mmui::MainWindow` 被最小化就还原。判据只能是类名 —— 两个窗口在 Win32 侧都是 `Qt51514QWindowIcon`、标题都叫「微信」
+- **好友自动通过会说一声** — 通过之后主动给主人发「已自动通过好友：xxx（来源）」，不再只往 journal 写一行
 
 ## 架构
 
@@ -103,7 +108,7 @@ bridge/           Linux 侧桥接
 prompts/          三个 agent 的人设与硬约束（IDENTITY.md / USER.md）
 openclaw.sample.json  权限分级配置样例
 probes/           反射探针：摸清 SDK 内部结构的四个小工具
-tools/            VM 内运维脚本（强杀重启 / 重新编译）
+tools/            VM 内运维脚本（强杀重启 / 重新编译 / 退登自愈）
 docs/             架构细节、API 表、踩坑清单
 ```
 

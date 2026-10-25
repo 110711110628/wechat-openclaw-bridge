@@ -56,7 +56,7 @@ WeChatClient C()
         {
             o.DebugMode = false;
             o.EnableOCR = true;
-            o.IsForceOpenUITree = false;
+            o.IsForceOpenUITree = true;
             o.InitAdressBook = true;
         });
         var f = sp.GetRequiredService<WeChatClientFactory>();
@@ -304,7 +304,7 @@ var JSON = new JsonSerializerOptions
     MaxDepth = 16
 };
 IResult J(object o) => Results.Content(JsonSerializer.Serialize(o, JSON), "application/json; charset=utf-8");
-IResult ERR(Exception ex) => J(new { ok = false, error = ex.GetType().Name + ": " + ex.Message });
+IResult ERR(Exception ex) { Console.WriteLine("[ERR] " + ex); return J(new { ok = false, error = ex.GetType().Name + ": " + ex.Message }); }
 
 app.Use(async (ctx, next) =>
 {
@@ -1236,27 +1236,41 @@ app.MapPost("/api/upload/send", async (US u) =>
 
 _ = Task.Run(async () =>
 {
-    try
+    // 启动时 SDK 偶尔会因为枚举抖动抛错（例如同一实例名出现两次），
+    // 之前一次失败就等于整轮没有监听，微信里的新消息再没人接。
+    // 这里改成最多试 6 次，直到每个会话都注册成功为止。
+    var autoWho = Environment.GetEnvironmentVariable("WXAPI_MONITOR_WHO");
+    var wants = string.IsNullOrWhiteSpace(autoWho)
+        ? new string[0]
+        : autoWho.Split(new string[] { "," }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    for (int attempt = 1; attempt <= 6; attempt++)
     {
-        await Task.Delay(2500);
-        C();
-        Console.WriteLine("[warm] client ready: instance=" + _self);
-        var autoWho = Environment.GetEnvironmentVariable("WXAPI_MONITOR_WHO");
-        if (!string.IsNullOrWhiteSpace(autoWho))
+        try
         {
-            foreach (var w in autoWho.Split(new string[] { "," }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            await Task.Delay(attempt == 1 ? 2500 : 6000);
+            C();
+            Console.WriteLine("[warm] try " + attempt + " ready: instance=" + _self);
+            var allOk = true;
+            foreach (var w in wants)
             {
+                if (_monWho.Contains(w)) continue;
                 try
                 {
-                    await SubmitMonitor(w);
-                    if (!_monWho.Contains(w)) _monWho.Add(w);
-                    Console.WriteLine("[warm] monitor submitted: " + w);
+                    var okm = await SubmitMonitor(w);
+                    if (okm && !_monWho.Contains(w)) _monWho.Add(w);
+                    Console.WriteLine("[warm] monitor " + w + " -> " + okm);
+                    if (!okm) allOk = false;
                 }
-                catch (Exception ex) { Console.WriteLine("[warm] monitor failed for " + w + ": " + ex.Message); }
+                catch (Exception ex)
+                {
+                    allOk = false;
+                    Console.WriteLine("[warm] monitor failed for " + w + ": " + ex.Message);
+                }
             }
+            if (allOk && wants.Length > 0) break;
         }
+        catch (Exception ex) { Console.WriteLine("[warm] init error (try " + attempt + "): " + ex.Message); }
     }
-    catch (Exception ex) { Console.WriteLine("[warm] init error: " + ex.Message); }
 });
 
 _ = Task.Run(async () =>
